@@ -192,6 +192,8 @@ impl Timer {
 struct Holder {
     app: gtk::Application,
     dir: PathBuf,
+    /// Where dropped text and links are saved as small files (see shelf.rs, notes).
+    notes: PathBuf,
     shelf: gtk::ApplicationWindow,
     /// What slides: the bordered card (the surface itself stays put).
     frame: gtk::Box,
@@ -237,6 +239,12 @@ impl Holder {
             // Nothing will be added or removed while this stands (shelf.rs refuses).
             eprintln!("holdthis4me: shelf folder {} unusable: {e}", dir.display());
         }
+        let notes = shelf::notes_dir();
+        match shelf::prepare(&notes).and_then(|()| shelf::prune_notes(&dir, &notes)) {
+            Ok(0) => {}
+            Ok(n) => eprintln!("holdthis4me: cleared {n} note(s) no item pointed to"),
+            Err(e) => eprintln!("holdthis4me: notes folder {} unusable: {e}", notes.display()),
+        }
 
         let shelf = gtk::ApplicationWindow::builder()
             .application(app)
@@ -271,7 +279,7 @@ impl Holder {
         drag_all.append(&gtk::Label::new(Some("Drag all")));
 
         let empty = gtk::Label::builder()
-            .label("Drop files or folders here")
+            .label("Drop files, folders, text or links here")
             .vexpand(true)
             .css_classes(["ht4m-empty"])
             .build();
@@ -304,6 +312,7 @@ impl Holder {
         let h = Rc::new(Holder {
             app: app.clone(),
             dir,
+            notes,
             shelf,
             frame,
             anim_css,
@@ -392,15 +401,35 @@ impl Holder {
         self.drag_all.add_controller(all);
     }
 
-    /// Accepts files and folders. Only ever COPY: accepting MOVE would tell the app they
-    /// came from (e.g. Nautilus) to delete its originals.
+    /// Accepts files and folders, and text or web links (saved as notes). Only ever COPY:
+    /// accepting MOVE would tell the app they came from (e.g. Nautilus) to delete its
+    /// originals. Files come first: a drag offering both (a file manager) gives files.
     fn drop_target(self: &Rc<Self>) -> gtk::DropTarget {
-        let target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+        let target = gtk::DropTarget::new(glib::Type::INVALID, gdk::DragAction::COPY);
+        target.set_types(&[gdk::FileList::static_type(), String::static_type()]);
         let w = Rc::downgrade(self);
         target.connect_drop(move |_, value, _, _| {
-            let (Some(h), Ok(files)) = (w.upgrade(), value.get::<gdk::FileList>()) else { return false };
-            let paths: Vec<PathBuf> = files.files().iter().filter_map(|f| f.path()).collect();
-            let took = h.hold(&paths);
+            let Some(h) = w.upgrade() else { return false };
+            let took = if let Ok(files) = value.get::<gdk::FileList>() {
+                // Local files are held as they are; a web address in the list (a link
+                // dragged from a browser) becomes a link note.
+                let (local, remote): (Vec<gio::File>, Vec<gio::File>) =
+                    files.files().into_iter().partition(|f| f.path().is_some());
+                let paths: Vec<PathBuf> = local.iter().filter_map(|f| f.path()).collect();
+                let links: Vec<shelf::Note> = remote
+                    .iter()
+                    .map(|f| f.uri().to_string())
+                    .filter(|u| shelf::is_link(u))
+                    .map(shelf::Note::Link)
+                    .collect();
+                let a = !paths.is_empty() && h.hold(&paths);
+                let b = !links.is_empty() && h.hold_notes(links);
+                a || b
+            } else if let Ok(text) = value.get::<String>() {
+                shelf::classify(&text).is_some_and(|n| h.hold_notes(vec![n]))
+            } else {
+                false
+            };
             h.reload();
             took
         });
@@ -681,11 +710,38 @@ impl Holder {
         button.remove_css_class("armed");
         button.set_tooltip_text(Some(CLEAR_TIP));
         for item in shelf::list(&self.dir) {
-            if let Err(e) = shelf::remove(&self.dir, &item.link) {
-                eprintln!("holdthis4me: {}: {e}", item.link.display());
-            }
+            self.let_go(&item);
         }
         self.reload();
+    }
+
+    /// Stop holding an item. For our own notes, their file goes too (it exists only to
+    /// be held); for everything else only the link is removed.
+    fn let_go(&self, item: &shelf::Item) {
+        if let Err(e) = shelf::remove(&self.dir, &item.link) {
+            eprintln!("holdthis4me: {}: {e}", item.link.display());
+            return;
+        }
+        if shelf::is_note(&self.notes, &item.target)
+            && let Err(e) = shelf::delete_note(&self.notes, &item.target)
+        {
+            eprintln!("holdthis4me: note {}: {e}", item.target.display());
+        }
+    }
+
+    /// Save dropped text or links as notes and hold them; true if any were.
+    fn hold_notes(&self, notes: Vec<shelf::Note>) -> bool {
+        let paths: Vec<PathBuf> = notes
+            .iter()
+            .filter_map(|n| match shelf::write_note(&self.notes, n) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    eprintln!("holdthis4me: can't save dropped text: {e}");
+                    None
+                }
+            })
+            .collect();
+        !paths.is_empty() && self.hold(&paths)
     }
 
     fn toggle(self: &Rc<Self>) {
@@ -759,7 +815,7 @@ impl Holder {
         let held: Vec<PathBuf> = items.iter().map(|i| i.target.clone()).collect();
         // A refused shelf folder lists nothing and takes nothing: say why, on the shelf.
         self.empty.set_label(&match shelf::usable(&self.dir) {
-            Ok(()) => "Drop files or folders here".to_string(),
+            Ok(()) => "Drop files, folders, text or links here".to_string(),
             Err(e) => format!("Shelf folder unusable:\n{e}\n{}", tilde(&self.dir)),
         });
         self.empty.set_visible(items.is_empty());
@@ -794,16 +850,32 @@ impl Holder {
         row.add_css_class("ht4m-item");
         row.set_tooltip_text(Some(&item.target.to_string_lossy()));
 
-        let icon = gtk::Image::from_icon_name("text-x-generic");
+        // Our own notes (dropped text and links) show what they say, not their file name.
+        // They're small local files, so reading one here can't hang.
+        let note = shelf::is_note(&self.notes, &item.target).then(|| shelf::read_note(&self.notes, &item.target)).flatten();
+        let icon = gtk::Image::from_icon_name(match &note {
+            Some(shelf::Note::Link(_)) => "insert-link-symbolic",
+            Some(shelf::Note::Text(_)) => "format-text-plain-symbolic",
+            None => "text-x-generic",
+        });
         icon.set_pixel_size(ICON_SIZE);
         icon.add_css_class("ht4m-icon");
+        let title = match &note {
+            Some(shelf::Note::Link(u)) => u.clone(),
+            Some(shelf::Note::Text(t)) => t.trim().lines().next().unwrap_or("").chars().take(200).collect(),
+            None => item.target.file_name().map_or_else(|| item.target.to_string_lossy(), |n| n.to_string_lossy()).into_owned(),
+        };
         let name = gtk::Label::builder()
-            .label(item.target.file_name().map_or_else(|| item.target.to_string_lossy(), |n| n.to_string_lossy()))
+            .label(title.as_str())
             .xalign(0.0)
             .ellipsize(pango::EllipsizeMode::Middle)
             .css_classes(["ht4m-name"])
             .build();
-        let parent = item.target.parent().map(tilde).unwrap_or_default();
+        let parent = match &note {
+            Some(shelf::Note::Link(_)) => "link".to_owned(),
+            Some(shelf::Note::Text(t)) => format!("text · {} characters", t.chars().count()),
+            None => item.target.parent().map(tilde).unwrap_or_default(),
+        };
         let place = gtk::Label::builder()
             .label(parent.as_str())
             .xalign(0.0)
@@ -829,11 +901,9 @@ impl Holder {
         row.append(&reveal);
         let let_go = icon_button("window-close-symbolic", "Let go (the file stays where it is)");
         let_go.add_css_class("ht4m-itembtn");
-        let link = item.link.clone();
+        let held = shelf::Item { link: item.link.clone(), target: item.target.clone() };
         let_go.connect_clicked(with(&w, move |h| {
-            if let Err(e) = shelf::remove(&h.dir, &link) {
-                eprintln!("holdthis4me: {}: {e}", link.display());
-            }
+            h.let_go(&held);
             h.reload();
         }));
         row.append(&let_go);
@@ -845,8 +915,18 @@ impl Holder {
         let wp = w.clone();
         source.connect_prepare(move |_, _, _| {
             let h = wp.upgrade()?;
-            let gone = h.missing.borrow().contains(&target);
-            (!gone).then(|| files_content(std::slice::from_ref(&target)))
+            if h.missing.borrow().contains(&target) {
+                return None;
+            }
+            let file = files_content(std::slice::from_ref(&target));
+            // A note offers its text (or address) first, so a text box or chat gets the
+            // words themselves; apps that only take files still get the file.
+            Some(match shelf::read_note(&h.notes, &target) {
+                Some(shelf::Note::Link(t) | shelf::Note::Text(t)) => {
+                    gdk::ContentProvider::new_union(&[gdk::ContentProvider::for_value(&t.to_value()), file])
+                }
+                None => file,
+            })
         });
         self.drag_source_events(&source, icon.upcast_ref());
         row.add_controller(source);
@@ -857,7 +937,10 @@ impl Holder {
         click.connect_pressed(move |_, n, _, _| {
             let Some(h) = wc.upgrade() else { return };
             if n == 2 && !h.missing.borrow().contains(&target) {
-                open(&target);
+                match shelf::read_note(&h.notes, &target) {
+                    Some(shelf::Note::Link(url)) => open_uri(&url),
+                    _ => open(&target),
+                }
                 h.hide();
             }
         });
@@ -896,6 +979,7 @@ impl Holder {
                     return;
                 };
                 match result {
+                    Ok(_) if shelf::is_note(&h.notes, &target) => {} // keeps its link/text icon
                     Ok(info) => set_icon(&icon, &info),
                     Err(e) if e.matches(gio::IOErrorEnum::NotFound) => {
                         h.missing.borrow_mut().insert(target.clone());
@@ -978,12 +1062,16 @@ fn files_content(paths: &[PathBuf]) -> gdk::ContentProvider {
 /// Open in its default app. Asynchronous: finding the app reads the file, which could
 /// hang on a dead mount.
 fn open(path: &Path) {
+    open_uri(&gio::File::for_path(path).uri());
+}
+
+/// Open a file URI or (for a link note) a web address in its default app.
+fn open_uri(uri: &str) {
     let ctx = gdk::Display::default().map(|d| d.app_launch_context());
-    let uri = gio::File::for_path(path).uri();
-    let path = path.to_owned();
-    gio::AppInfo::launch_default_for_uri_async(&uri, ctx.as_ref(), None::<&gio::Cancellable>, move |result| {
+    let what = uri.to_owned();
+    gio::AppInfo::launch_default_for_uri_async(uri, ctx.as_ref(), None::<&gio::Cancellable>, move |result| {
         if let Err(e) = result {
-            eprintln!("holdthis4me: can't open {}: {e}", path.display());
+            eprintln!("holdthis4me: can't open {what}: {e}");
         }
     });
 }

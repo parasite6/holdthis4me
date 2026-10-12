@@ -241,6 +241,165 @@ pub fn remove(dir: &Path, link: &Path) -> io::Result<()> {
     Err(not_link())
 }
 
+// ---------- notes: dropped text and links ----------
+//
+// Text or a link dropped on the shelf isn't a file, so it's saved as a small one in a
+// private notes folder next to the shelf, and held like any other file. These are the
+// only files holdthis4me ever deletes, and only its own: a note's file goes when its
+// item is let go, and notes no item points to are cleared out at startup. Every such
+// delete goes through the same pinned, checked folder handle as the shelf, and only
+// ever removes a regular file directly inside the notes folder.
+
+/// Largest text that's kept; bigger drops are refused rather than truncated.
+pub const NOTE_MAX: usize = 1 << 20;
+/// How many characters of the text (or link) name its file.
+const NOTE_NAME_CHARS: usize = 48;
+
+#[derive(Debug, PartialEq)]
+pub enum Note {
+    Text(String),
+    Link(String),
+}
+
+/// `~/.local/share/holdthis4me/notes`.
+pub fn notes_dir() -> PathBuf {
+    gtk::glib::user_data_dir().join("holdthis4me").join("notes")
+}
+
+/// What dropped text is: a single web address on its own is a link, anything else text.
+pub fn classify(text: &str) -> Option<Note> {
+    let t = text.trim();
+    if t.is_empty() || t.len() > NOTE_MAX {
+        return None;
+    }
+    Some(if is_link(t) { Note::Link(t.to_owned()) } else { Note::Text(text.to_owned()) })
+}
+
+/// An http(s) address with no whitespace in it.
+pub fn is_link(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    (lower.starts_with("https://") || lower.starts_with("http://"))
+        && s.len() > "http://".len()
+        && !s.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// A file name from the start of the text: one line, no slashes or control characters.
+fn note_name(note: &Note) -> String {
+    let (raw, ext) = match note {
+        Note::Text(t) => (t.trim().lines().next().unwrap_or("").to_owned(), ".txt"),
+        Note::Link(u) => {
+            let rest = u.split_once("://").map_or(u.as_str(), |(_, r)| r);
+            (rest.trim_end_matches('/').replace('/', " › "), ".url")
+        }
+    };
+    let clean: String = raw
+        .chars()
+        .map(|c| if c == '/' || c.is_control() { ' ' } else { c })
+        .take(NOTE_NAME_CHARS)
+        .collect();
+    let clean = clean.trim().trim_start_matches('.').trim();
+    let stem = if clean.is_empty() { "note" } else { clean };
+    format!("{stem}{ext}")
+}
+
+/// Save a note as a new file (0600, never replacing anything) and return its path.
+/// Links are written as Internet shortcuts (`[InternetShortcut]` / `URL=`).
+pub fn write_note(notes: &Path, note: &Note) -> io::Result<PathBuf> {
+    let body = match note {
+        Note::Text(t) => t.clone(),
+        Note::Link(u) => format!("[InternetShortcut]\nURL={u}\n"),
+    };
+    if body.len() > NOTE_MAX {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "too big to hold"));
+    }
+    let fd = open_dir(notes)?;
+    let name = note_name(note);
+    for n in 1..10_000 {
+        let candidate = numbered(&name, n);
+        let name_c = cstr(OsStr::new(&candidate))?;
+        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let file = unsafe { libc::openat(fd.as_raw_fd(), name_c.as_ptr(), flags, 0o600 as libc::c_uint) };
+        if file < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                continue;
+            }
+            return Err(e);
+        }
+        let mut file = fs::File::from(unsafe { OwnedFd::from_raw_fd(file) });
+        io::Write::write_all(&mut file, body.as_bytes())?;
+        return Ok(notes.join(candidate));
+    }
+    Err(io::Error::new(io::ErrorKind::AlreadyExists, "too many notes with this name"))
+}
+
+/// The note a held target is, if it's one of ours (a file directly in the notes folder).
+pub fn read_note(notes: &Path, target: &Path) -> Option<Note> {
+    if target.parent() != Some(notes) || fs::symlink_metadata(target).ok()?.file_type().is_symlink() {
+        return None;
+    }
+    let mut body = Vec::new();
+    io::Read::read_to_end(&mut io::Read::take(fs::File::open(target).ok()?, NOTE_MAX as u64 + 1), &mut body).ok()?;
+    let body = String::from_utf8(body).ok()?;
+    if target.extension().is_some_and(|e| e == "url") {
+        let url = body.lines().find_map(|l| l.strip_prefix("URL="))?.trim().to_owned();
+        return is_link(&url).then_some(Note::Link(url));
+    }
+    Some(Note::Text(body))
+}
+
+/// Is this held target one of our notes (by location only, nothing read)?
+pub fn is_note(notes: &Path, target: &Path) -> bool {
+    target.parent() == Some(notes)
+}
+
+/// Delete a note's file: only a regular file directly inside the notes folder.
+pub fn delete_note(notes: &Path, target: &Path) -> io::Result<()> {
+    let not_note = || io::Error::new(io::ErrorKind::InvalidInput, "not a note");
+    if target.parent() != Some(notes) {
+        return Err(not_note());
+    }
+    let fd = open_dir(notes)?;
+    let name = cstr(target.file_name().ok_or_else(not_note)?)?;
+    delete_regular_at(&fd, &name).map_err(|e| if e.kind() == io::ErrorKind::InvalidInput { not_note() } else { e })
+}
+
+/// Unlink `name` in the pinned folder only if it's a regular file. Moved aside first and
+/// checked after, as in `remove`, so nothing can be swapped in between.
+fn delete_regular_at(fd: &OwnedFd, name: &CString) -> io::Result<()> {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let staged = format!("{STAGING}n{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
+    let staged = cstr(OsStr::new(&staged))?;
+    rename_at(fd, name, &staged)?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    check(unsafe { libc::fstatat(fd.as_raw_fd(), staged.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) })?;
+    if st.st_mode & libc::S_IFMT == libc::S_IFREG {
+        return check(unsafe { libc::unlinkat(fd.as_raw_fd(), staged.as_ptr(), 0) });
+    }
+    rename_at(fd, &staged, name)?;
+    Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"))
+}
+
+/// Delete notes no shelf item points to (left behind when a link was deleted by hand).
+/// Regular files only; anything else in the notes folder is left alone.
+pub fn prune_notes(shelf: &Path, notes: &Path) -> io::Result<usize> {
+    // A refused shelf lists as empty, which would make every note look orphaned.
+    usable(shelf)?;
+    let fd = open_dir(notes)?;
+    let held: HashSet<PathBuf> = list(shelf).into_iter().map(|i| i.target).collect();
+    let mut pruned = 0;
+    for entry in fs::read_dir(notes)?.flatten() {
+        let name = entry.file_name();
+        if name.as_bytes().starts_with(STAGING.as_bytes()) || held.contains(&notes.join(&name)) {
+            continue;
+        }
+        if entry.file_type().is_ok_and(|t| t.is_file()) && delete_regular_at(&fd, &cstr(&name)?).is_ok() {
+            pruned += 1;
+        }
+    }
+    Ok(pruned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,5 +572,74 @@ mod tests {
             assert!(out.ends_with(".pdf"));
         }
         assert!(!numbered(".ht4m-removing-1-2", 1).starts_with(STAGING));
+    }
+
+    #[test]
+    fn notes_are_written_read_and_named_safely() {
+        let root = tmp("notes");
+        let notes = root.join("notes");
+        prepare(&notes).unwrap();
+
+        assert_eq!(classify("  https://github.com/storytold \n"), Some(Note::Link("https://github.com/storytold".into())));
+        assert!(matches!(classify("see https://x.com later"), Some(Note::Text(_))));
+        assert_eq!(classify("   "), None);
+        assert_eq!(classify(&"x".repeat(NOTE_MAX + 1)), None);
+
+        let link = write_note(&notes, &Note::Link("https://github.com/storytold/".into())).unwrap();
+        assert_eq!(link.file_name().unwrap(), "github.com › storytold.url");
+        assert_eq!(read_note(&notes, &link), Some(Note::Link("https://github.com/storytold/".into())));
+
+        let text = "../../etc/passwd\nsecond line";
+        let t = write_note(&notes, &Note::Text(text.into())).unwrap();
+        assert_eq!(t.parent(), Some(notes.as_path()));
+        assert!(!t.file_name().unwrap().to_string_lossy().contains('/'));
+        assert_eq!(read_note(&notes, &t), Some(Note::Text(text.into())));
+        assert_eq!(fs::metadata(&t).unwrap().permissions().mode() & 0o777, 0o600);
+        let t2 = write_note(&notes, &Note::Text(text.into())).unwrap();
+        assert_ne!(t, t2, "never overwrites");
+
+        // A .url file whose URL isn't a web address isn't treated as a link.
+        let bad = notes.join("bad.url");
+        fs::write(&bad, "[InternetShortcut]\nURL=file:///etc/passwd\n").unwrap();
+        assert_eq!(read_note(&notes, &bad), None);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn only_our_own_note_files_are_ever_deleted() {
+        let root = tmp("notedel");
+        let shelf = shelf_in(&root);
+        let notes = root.join("notes");
+        prepare(&notes).unwrap();
+        let outside = root.join("real.txt");
+        fs::write(&outside, "keep").unwrap();
+
+        // Outside the notes folder, a symlink in it, a folder in it: all refused.
+        assert!(delete_note(&notes, &outside).is_err());
+        let sneaky = notes.join("sneaky.txt");
+        std::os::unix::fs::symlink(&outside, &sneaky).unwrap();
+        assert!(delete_note(&notes, &sneaky).is_err());
+        fs::create_dir(notes.join("dir.txt")).unwrap();
+        assert!(delete_note(&notes, &notes.join("dir.txt")).is_err());
+        assert!(outside.exists() && notes.join("dir.txt").exists());
+        assert!(fs::symlink_metadata(&sneaky).unwrap().file_type().is_symlink());
+
+        // Held notes survive pruning, orphans go, the symlink and folder stay.
+        let held = write_note(&notes, &Note::Text("held".into())).unwrap();
+        let orphan = write_note(&notes, &Note::Text("orphan".into())).unwrap();
+        add(&shelf, &held).unwrap().unwrap();
+        assert_eq!(prune_notes(&shelf, &notes).unwrap(), 1);
+        assert!(held.exists() && !orphan.exists());
+        assert!(fs::symlink_metadata(&sneaky).is_ok() && notes.join("dir.txt").exists() && outside.exists());
+
+        // If the shelf folder is refused (lists as empty), nothing is pruned.
+        fs::set_permissions(&shelf, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(prune_notes(&shelf, &notes).is_err());
+        assert!(held.exists());
+        fs::set_permissions(&shelf, fs::Permissions::from_mode(0o700)).unwrap();
+
+        delete_note(&notes, &held).unwrap();
+        assert!(!held.exists());
+        fs::remove_dir_all(&root).unwrap();
     }
 }

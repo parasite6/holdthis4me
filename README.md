@@ -10,6 +10,9 @@ through Nautilus in every upload dialog.
 | --- | --- |
 | Touch the top screen border where the shelf lives (the top-left corner, as wide as the shelf) | The shelf drops down instantly |
 | Drag files or folders up to that same stretch of the top border | The shelf opens at once, and you drop them on it |
+| Drop selected text, or a link from a browser | It's held as a note: the text itself, or the link's address |
+| Drag a note out | A text box or chat gets the text or address; an app that only takes files gets a small `.txt` / `.url` file |
+| Double-click a link note | Opens it in your browser |
 | `+` / folder button | Opens the file chooser, so you can pick files or folders by browsing |
 | Drag an item off the shelf into any app | The app gets the real file; the item stays on the shelf |
 | **Drag all** (2+ items) | Drags everything at once |
@@ -43,8 +46,22 @@ Safety rules:
 
 Nothing reads the held files on the main thread. Whether an item still exists, and its icon, are checked in the background, so a held file on a dead network mount can't freeze the shelf.
 
-Only files and folders are accepted. Things that aren't local files are ignored: a link or an
-image dragged straight out of a browser page, for example.
+### Text and links
+
+Text and links aren't files, so each one is saved as a small file in
+`~/.local/share/holdthis4me/notes` (private, 0600 files) and held like anything else:
+- **Text:** a `.txt` named after its first line.
+- **Links:** a `.url` Internet shortcut named after the address.
+
+A single web address on its own counts as a link; anything else is text, up to 1 MiB.
+
+An image dragged out of a web page arrives as its address, so it becomes a link note, not
+the image.
+
+These notes are the only files holdthis4me ever deletes, and only its own:
+- **Letting go:** when you let go of a note, its file goes too.
+- **Startup:** notes no item points to (say, after you deleted links by hand) are cleared out. This never runs if the shelf folder is refused, because a refused shelf lists as empty and every note would look orphaned.
+- **What can be deleted:** only a regular file directly inside the notes folder. Deletes go through the same pinned, moved-aside-then-checked path as shelf links.
 
 ## Look
 
