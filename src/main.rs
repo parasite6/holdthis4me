@@ -266,7 +266,7 @@ impl Holder {
         shelf.set_anchor(Edge::Left, true);
         shelf.set_exclusive_zone(-1); // the true corner, over the bar
 
-        let title = gtk::Label::builder().label("hold this").xalign(0.0).css_classes(["ht4m-title"]).build();
+        let title = gtk::Label::builder().label("holdthis4me").xalign(0.0).css_classes(["ht4m-title"]).build();
         let count = gtk::Label::builder().xalign(0.0).hexpand(true).css_classes(["ht4m-count"]).build();
         let add_files = icon_button("list-add-symbolic", "Add files…");
         let add_folders = icon_button("folder-new-symbolic", "Add folders…");
