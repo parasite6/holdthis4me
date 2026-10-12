@@ -8,8 +8,8 @@ through Nautilus in every upload dialog.
 
 | Do this | What happens |
 | --- | --- |
-| Touch the top or left screen border where the shelf lives | The shelf drops down instantly |
-| Drag files or folders onto the top part of the left screen edge | The shelf opens at once, and you drop them on it |
+| Touch the top screen border where the shelf lives (the top-left corner, as wide as the shelf) | The shelf drops down instantly |
+| Drag files or folders up to that same stretch of the top border | The shelf opens at once, and you drop them on it |
 | `+` / folder button | Opens the file chooser, so you can pick files or folders by browsing |
 | Drag an item off the shelf into any app | The app gets the real file; the item stays on the shelf |
 | **Drag all** (2+ items) | Drags everything at once |
@@ -74,12 +74,11 @@ Two lines in the Hyprland config hook it up (already added):
 
 ## How it works
 
-Each screen gets three layer surfaces:
+Each screen gets two layer surfaces:
 
-All of these sit on the Top layer while the shelf is hidden: above normal windows, under fullscreen ones. A fullscreen game or video never gets the shelf popping over it, and nothing is composited on top of it. The shelf moves to the Overlay layer only while it's out.
+Both sit on the Top layer while the shelf is hidden: above normal windows, under fullscreen ones. A fullscreen game or video never gets the shelf popping over it, and nothing is composited on top of it. The shelf moves to the Overlay layer only while it's out.
 
 - **Top:** an invisible 2 px strip along the top border, exactly as long as the shelf is wide. Hover or drag opens the shelf.
-- **Left:** an invisible 2 px strip down the left border, as long as the shelf's smallest height. Hover or drag opens it.
 
 Only the outermost 2 px react. Apps can reach right up to the screen edge, so nothing sits further in, where it could cover their buttons.
 - **Shelf:** always mapped, so it comes out without waiting for a new window. While hidden, it's slid away, transparent and click-through: its input region is empty and re-applied after every layout. It sizes to its items (260 px minimum), so a drag that opened it lands on it.

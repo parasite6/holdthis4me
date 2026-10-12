@@ -1,10 +1,10 @@
 //! holdthis4me: a shelf for files and folders on the top-left of the screen.
 //!
-//! Touch the top or left screen border by the corner, or drag something there, and the
+//! Touch the top screen border by the corner, or drag something there, and the
 //! shelf drops out. Drop files in; later drag them out into any app. The shelf only holds
 //! links (src/shelf.rs): nothing is copied and nothing lives in memory.
 //!
-//! Layer surfaces: two invisible 2 px trigger strips per screen (top and left border), and
+//! Layer surfaces: an invisible 2 px trigger strip per screen (on the top border), and
 //! the shelf, which stays mapped and is slid away, transparent and click-through while
 //! hidden.
 
@@ -23,9 +23,9 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 const APP_ID: &str = "local.holdthis4me";
 const STYLE: &str = include_str!("style.css");
 
-/// The triggers are 2 px strips on the screen border itself (never further in, where
-/// apps are), exactly as long as the shelf is wide/tall, so touching the border anywhere
-/// the shelf will appear opens it at once.
+/// The trigger is a 2 px strip on the top screen border itself (never further in, where
+/// apps are), exactly as long as the shelf is wide, so touching the border anywhere the
+/// shelf will appear opens it at once.
 const STRIP_WIDTH: i32 = 2;
 /// The shelf's frame margin (style.css .ht4m-frame): the gap to the screen edges.
 const FRAME_MARGIN: i32 = 16;
@@ -47,13 +47,6 @@ const SHELF_WIDTH: i32 = 372;
 /// The surface's height when empty or nearly so; it grows with the items.
 const SHELF_MIN_HEIGHT: i32 = 260;
 
-#[derive(Clone, Copy, PartialEq)]
-enum Trigger {
-    /// 2 px along the top edge, as long as the shelf is wide.
-    Top,
-    /// 2 px down the left edge, as long as the shelf's smallest height.
-    Left,
-}
 const ICON_SIZE: i32 = 32;
 const CLEAR_TIP: &str = "Let go of everything (the files stay where they are)";
 
@@ -492,10 +485,10 @@ impl Holder {
             (0..monitors.n_items()).filter_map(|i| monitors.item(i).and_downcast()).collect();
         let triggers = current
             .iter()
-            .flat_map(|m| [self.trigger(m, Trigger::Top), self.trigger(m, Trigger::Left)])
+            .map(|m| self.trigger(m))
             .collect();
         *self.triggers.borrow_mut() = triggers;
-        // Map the shelf again after the new strips, so it stacks above them, and never on
+        // Map the shelf again after the new strip, so it stacks above it, and never on
         // a screen that's gone. (Closes it if it was open.)
         if !self.dragging_out.get() {
             self.out.set(false);
@@ -510,7 +503,8 @@ impl Holder {
         }
     }
 
-    fn trigger(self: &Rc<Self>, monitor: &gdk::Monitor, kind: Trigger) -> gtk::ApplicationWindow {
+    /// The 2 px strip along the top border, as long as the shelf is wide.
+    fn trigger(self: &Rc<Self>, monitor: &gdk::Monitor) -> gtk::ApplicationWindow {
         let t = gtk::ApplicationWindow::builder().application(&self.app).css_classes(["ht4m-trigger"]).build();
         t.init_layer_shell();
         // Top, not Overlay: above normal windows, but under fullscreen ones, so a game or
@@ -522,10 +516,7 @@ impl Holder {
         t.set_anchor(Edge::Left, true);
         t.set_exclusive_zone(-1);
         t.set_monitor(Some(monitor));
-        let (width, height) = match kind {
-            Trigger::Top => (SHELF_WIDTH - FRAME_MARGIN, STRIP_WIDTH),
-            Trigger::Left => (STRIP_WIDTH, SHELF_MIN_HEIGHT - FRAME_MARGIN),
-        };
+        let (width, height) = (SHELF_WIDTH - FRAME_MARGIN, STRIP_WIDTH);
         // Needs a child of exactly this size: a GTK window without one is 200×200.
         let fill = gtk::Box::new(gtk::Orientation::Vertical, 0);
         fill.set_size_request(width, height);
@@ -782,9 +773,8 @@ impl Holder {
         self.fit();
     }
 
-    /// At least as tall as the left trigger strip (so a drag along the edge lands on the
-    /// shelf), taller as items pile up, scrolling past 80% of the screen. The slide
-    /// starts exactly one shelf-height above the edge.
+    /// At least SHELF_MIN_HEIGHT, taller as items pile up, scrolling past 80% of the
+    /// screen. The slide starts exactly one shelf-height above the edge.
     fn fit(&self) {
         let Some(m) = self.monitor.borrow().clone() else { return };
         let screen = m.geometry().height();
