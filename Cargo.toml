@@ -1,0 +1,11 @@
+[package]
+name = "holdthis4me"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gtk = { version = "0.11.5", package = "gtk4", features = ["v4_14"] }
+gtk4-layer-shell = "0.8.1"
+
+[profile.release]
+strip = true

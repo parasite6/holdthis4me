@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Start the holdthis4me background process through ensure-running: one healthy instance,
+# never duplicated, no restart loops. Used by Hyprland autostart and install.sh.
+#
+# Healthy = has a Wayland display and its main loop answers on D-Bus (listing the app's
+# actions is handled on the main thread, so a hung UI fails this; it never opens the shelf).
+bin="$HOME/.local/share/holdthis4me/bin"
+exec /usr/local/bin/ensure-running \
+    --name holdthis4me \
+    --comm holdthis4me \
+    --wait-wayland \
+    --health 'tr "\0" "\n" < /proc/$PID/environ | grep -q "^WAYLAND_DISPLAY=." && timeout 3 gdbus call --session --dest local.holdthis4me --object-path /local/holdthis4me --method org.gtk.Actions.List | grep -q .' \
+    -- "$bin/holdthis4me"

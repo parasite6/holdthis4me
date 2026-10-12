@@ -1,0 +1,146 @@
+/* holdthis4me — built like the quickshell bar and dock: a 2 px border that fades from
+ * primary to on_primary, the background colour inside, rounded, translucent, soft shadow,
+ * JetBrains Mono, peach (primary) icons and pills. The ht_* colours are generated from
+ * ~/.config/ml4w/colors/colors.json (main.rs), so it follows wallpaper changes. */
+
+window.ht4m,
+window.ht4m-trigger {
+  background: transparent;
+  box-shadow: none;
+}
+
+/* Not fully transparent: GTK never commits a frame for a surface with nothing to draw,
+ * and Hyprland then never maps it. 1% black on a 2 px strip can't be seen. */
+window.ht4m-trigger {
+  min-width: 0;
+  min-height: 0;
+  background-color: rgba(0, 0, 0, 0.01);
+}
+
+window.ht4m {
+  font-family: "JetBrains Mono", monospace;
+}
+
+/* The gradient border layer (the bar's pillBg). The margin is the gap to the screen
+ * edges and room for the shadow. */
+.ht4m-frame {
+  margin: 16px;
+  padding: 2px;
+  border-radius: 16px;
+  background-image: linear-gradient(to bottom, alpha(@ht_primary, 0.8), alpha(@ht_on_primary, 0.8));
+  box-shadow: 0 0 15px alpha(@ht_shadow, 0.4);
+}
+
+/* The fill, inset by the border. A little more opaque than the bar (0.8) so text stays
+ * readable over white windows. */
+.ht4m-card {
+  padding: 10px 8px 8px 10px;
+  border-radius: 14px;
+  color: @ht_on_background;
+  background-color: alpha(@ht_background, 0.88);
+  transition: box-shadow 150ms ease;
+}
+
+/* Something is being dragged over it. */
+window.ht4m:drop(active) .ht4m-card {
+  box-shadow: inset 0 0 0 2px @ht_primary;
+}
+
+.ht4m-header {
+  padding: 0 0 4px 4px;
+}
+
+.ht4m-title {
+  color: @ht_primary;
+  font-weight: bold;
+  margin-right: 8px;
+}
+
+.ht4m-count {
+  color: alpha(@ht_primary, 0.6);
+}
+
+/* Like the bar's buttons: 30 px pills, primary icon, filled primary when pressed. */
+.ht4m-btn {
+  min-width: 30px;
+  min-height: 30px;
+  padding: 0;
+  border: none;
+  border-radius: 15px;
+  color: @ht_primary;
+  background: transparent;
+  box-shadow: none;
+  transition: background-color 150ms ease, color 150ms ease;
+}
+
+.ht4m-btn:hover {
+  background-color: alpha(@ht_primary, 0.18);
+}
+
+.ht4m-btn:active {
+  color: @ht_background;
+  background-color: @ht_primary;
+}
+
+/* Like an inactive workspace bubble: a 1 px primary outline. */
+.ht4m-dragall {
+  margin: 0 2px 2px 0;
+  padding: 5px 12px;
+  border-radius: 15px;
+  color: @ht_primary;
+  border: 1px solid @ht_primary;
+}
+
+.ht4m-dragall:hover {
+  color: @ht_background;
+  background-color: @ht_primary;
+}
+
+.ht4m-empty {
+  margin: 2px 2px 2px 0;
+  padding: 24px;
+  color: @ht_on_surface_variant;
+  border: 2px dashed @ht_outline_variant;
+  border-radius: 12px;
+}
+
+.ht4m-item {
+  padding: 6px 4px 6px 8px;
+  border-radius: 12px;
+  transition: background-color 120ms ease;
+}
+
+.ht4m-item:hover {
+  background-color: alpha(@ht_primary, 0.12);
+}
+
+.ht4m-item.missing {
+  opacity: 0.5;
+}
+
+.ht4m-name {
+  color: @ht_on_background;
+}
+
+.ht4m-place {
+  color: @ht_on_surface_variant;
+  font-size: smaller;
+}
+
+/* Per-item buttons appear on hover only. */
+.ht4m-item .ht4m-itembtn {
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.ht4m-item:hover .ht4m-itembtn {
+  opacity: 1;
+}
+
+scrollbar {
+  background: transparent;
+}
+
+scrollbar slider {
+  background-color: alpha(@ht_primary, 0.5);
+}
