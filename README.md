@@ -14,7 +14,7 @@ through Nautilus in every upload dialog.
 | Drag an item off the shelf into any app | The app gets the real file; the item stays on the shelf |
 | **Drag all** (2+ items) | Drags everything at once |
 | Double-click an item | Opens it in its default app |
-| Hover an item → pin icon | Shows the file selected in Nautilus |
+| Hover an item → location (crosshair) icon | Shows the file selected in Nautilus |
 | Hover an item → × | Lets go of it (the file itself is untouched) |
 | Clear button | Lets go of everything |
 | Open-folder button | Opens the shelf folder in Nautilus |
