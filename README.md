@@ -55,6 +55,12 @@ Text and links aren't files, so each one is saved as a small file in
 
 A single web address on its own counts as a link; anything else is text, up to 1 MiB.
 
+Text shows the icon and name of the app you dragged it from: "text from Brave · 120
+characters".
+- **How it's found:** Wayland doesn't tell the receiving app where a drag came from, so when a drag first reaches the shelf, holdthis4me asks Hyprland, over its IPC socket, for the active window. The window you drag from keeps focus during a drag. That window's class is matched to an installed app by its launcher's `StartupWMClass`, or a launcher id equal to the class.
+- **Where it's stored:** an extended attribute on the note's file (`user.holdthis4me.source`), so the file still contains exactly the text you dropped.
+- **Links** keep their link icon.
+
 An image dragged out of a web page arrives as its address, so it becomes a link note, not
 the image.
 
