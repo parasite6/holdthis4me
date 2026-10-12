@@ -32,10 +32,10 @@ const STRIP_WIDTH: i32 = 2;
 /// The shelf's frame margin (style.css .ht4m-frame): the gap to the screen edges.
 const FRAME_MARGIN: i32 = 16;
 /// Rising back out (style.css .ht4m-frame.away has the matching duration).
-const RISE_MS: u64 = 200;
+const RISE_MS: u64 = 150;
 /// After the pointer leaves the shelf it goes away after this long. A drag that leaves
 /// (usually: just dropped something) gets longer, so you see the item land.
-const LEAVE_MS: u64 = 350;
+const LEAVE_MS: u64 = 150;
 const AFTER_DROP_MS: u64 = 1200;
 /// Opened but never touched (e.g. after the file picker, or --toggle): go away anyway.
 const UNTOUCHED_MS: u64 = 2500;
