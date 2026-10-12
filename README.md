@@ -8,7 +8,7 @@ through Nautilus in every upload dialog.
 
 | Do this | What happens |
 | --- | --- |
-| Rest the pointer in the top-left corner (a loose 48 px square) | The shelf drops down (after a 150 ms pause, so passing by doesn't trigger it) |
+| Push the pointer against the top or left screen border, within 200 px of the corner | The shelf drops down (after a 150 ms pause, so passing by doesn't trigger it) |
 | Drag files or folders onto the top part of the left screen edge | The shelf opens at once, and you drop them on it |
 | `+` / folder button | Opens the file chooser, so you can pick files or folders by browsing |
 | Drag an item off the shelf into any app | The app gets the real file; the item stays on the shelf |
@@ -70,8 +70,10 @@ Two lines in the Hyprland config hook it up (already added):
 
 Each screen gets three layer surfaces:
 
-- **Corner:** an invisible 48 px square at the very corner. Hover or drag opens the shelf. It sits in empty space, because the bar reserves the top of the screen.
-- **Edge:** an invisible 2 px strip down the left edge, 45% of the screen tall. Only drags open the shelf here.
+- **Top:** an invisible 2 px strip along the top border, 200 px from the corner. Hover or drag opens the shelf.
+- **Left:** an invisible 2 px strip down the left border, 45% of the screen tall. Hover opens the shelf in the top 200 px; a drag opens it anywhere along the strip.
+
+Only the outermost 2 px react. Apps can reach right up to the screen edge, so nothing sits further in, where it could cover their buttons.
 - **Shelf:** mapped only while it's out. It covers the screen edge and is at least as tall as the strip, so a drag that opened it lands on it.
 
 The triggers aren't fully transparent; they're 1% black. GTK never commits a frame for a surface

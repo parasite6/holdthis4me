@@ -24,10 +24,12 @@ const STYLE: &str = include_str!("style.css");
 /// The trigger strip: this wide, and this share of the screen height from the top.
 const STRIP_WIDTH: i32 = 2;
 const STRIP_SHARE: f64 = 0.45;
-/// Hovering opens it only in the corner: this square, after resting in it this long, so
-/// passing by doesn't pop the shelf out. It's empty space (the bar reserves the top of
-/// the screen; windows never go there). Drags on the corner or the strip open it at once.
-const CORNER_ZONE: i32 = 48;
+/// Hovering opens it when the pointer is pushed against the screen border near the
+/// corner: the top edge or the left edge, within this distance of the corner, after
+/// resting there this long (so passing by doesn't pop it out). Only the 2 px border
+/// itself reacts, never anything inside the screen where apps are. Drags anywhere on
+/// either strip open it at once.
+const BORDER_REACH: i32 = 200;
 const DWELL_MS: u64 = 150;
 /// The drop-in/rise-out animation (style.css has the matching durations).
 const RISE_MS: u64 = 200;
@@ -46,10 +48,10 @@ const SHELF_WIDTH: i32 = 372;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Trigger {
-    /// The corner square: hover or drag.
-    Corner,
-    /// The thin strip down the left edge: drags only.
-    Edge,
+    /// 2 px along the top edge from the corner.
+    Top,
+    /// 2 px down the left edge (taller, so drags along the edge land too).
+    Left,
 }
 const ICON_SIZE: i32 = 32;
 
@@ -473,7 +475,7 @@ impl Holder {
         }
         let triggers = current
             .iter()
-            .flat_map(|m| [self.trigger(m, Trigger::Corner), self.trigger(m, Trigger::Edge)])
+            .flat_map(|m| [self.trigger(m, Trigger::Top), self.trigger(m, Trigger::Left)])
             .collect();
         *self.triggers.borrow_mut() = triggers;
     }
@@ -489,8 +491,8 @@ impl Holder {
         t.set_exclusive_zone(-1);
         t.set_monitor(Some(monitor));
         let (width, height) = match kind {
-            Trigger::Corner => (CORNER_ZONE, CORNER_ZONE),
-            Trigger::Edge => (STRIP_WIDTH, strip_height(monitor)),
+            Trigger::Top => (BORDER_REACH, STRIP_WIDTH),
+            Trigger::Left => (STRIP_WIDTH, strip_height(monitor).max(BORDER_REACH)),
         };
         // Needs a child of exactly this size: a GTK window without one is 200×200.
         let fill = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -499,23 +501,37 @@ impl Holder {
         t.set_default_size(width, height);
 
         let w = Rc::downgrade(self);
-        if kind == Trigger::Corner {
-            // Resting anywhere in the corner square opens it.
-            let hover = gtk::EventControllerMotion::new();
-            let m = monitor.clone();
-            hover.connect_enter(move_with(&w, move |h| {
-                if !h.shown() && !h.dwell.running() {
-                    let (w, m) = (Rc::downgrade(h), m.clone());
-                    h.dwell.start(DWELL_MS, move || {
-                        if let Some(h) = w.upgrade() {
-                            h.show(&m, UNTOUCHED_MS);
-                        }
-                    });
+        // Resting against the border near the corner opens it.
+        let m = monitor.clone();
+        let near_corner = move |h: &Rc<Holder>, y: f64| {
+            if h.shown() || (kind == Trigger::Left && y > BORDER_REACH as f64) {
+                h.dwell.cancel();
+            } else if !h.dwell.running() {
+                let (w, m) = (Rc::downgrade(h), m.clone());
+                h.dwell.start(DWELL_MS, move || {
+                    if let Some(h) = w.upgrade() {
+                        h.show(&m, UNTOUCHED_MS);
+                    }
+                });
+            }
+        };
+        let near_corner = Rc::new(near_corner);
+        let hover = gtk::EventControllerMotion::new();
+        for signal in ["enter", "motion"] {
+            let (w, near_corner) = (w.clone(), near_corner.clone());
+            let f = move |_: &gtk::EventControllerMotion, _: f64, y: f64| {
+                if let Some(h) = w.upgrade() {
+                    near_corner(&h, y);
                 }
-            }));
-            hover.connect_leave(with(&w, |h| h.dwell.cancel()));
-            t.add_controller(hover);
+            };
+            if signal == "enter" {
+                hover.connect_enter(f);
+            } else {
+                hover.connect_motion(f);
+            }
         }
+        hover.connect_leave(with(&w, |h| h.dwell.cancel()));
+        t.add_controller(hover);
 
         // Something from another app is being dragged onto the corner or the edge: open
         // right away.
