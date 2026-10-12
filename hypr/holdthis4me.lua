@@ -1,8 +1,9 @@
--- holdthis4me shelf: slides out from the left edge. The 2 px trigger strip on the left
--- edge is invisible and never animates.
+-- holdthis4me: the shelf animates itself (drops in from the top, rises back out), so
+-- Hyprland must not add its own layer animation on top. The trigger surfaces (corner
+-- square, left-edge strip) are invisible and never animate either.
 hl.layer_rule({
     match = { namespace = "holdthis4me" },
-    animation = "slide left",
+    no_anim = true,
 })
 hl.layer_rule({
     match = { namespace = "holdthis4me-trigger" },

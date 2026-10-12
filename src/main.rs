@@ -24,11 +24,14 @@ const STYLE: &str = include_str!("style.css");
 /// The trigger strip: this wide, and this share of the screen height from the top.
 const STRIP_WIDTH: i32 = 2;
 const STRIP_SHARE: f64 = 0.45;
-/// Plain hovering only counts in the top this-many pixels of the strip (the corner), and
-/// only after resting there this long, so passing by doesn't pop the shelf out. Drags
-/// anywhere on the strip open it at once.
-const CORNER: f64 = 8.0;
+/// Hovering opens it only in the corner: this square, after resting in it this long, so
+/// passing by doesn't pop the shelf out. It's empty space (the bar reserves the top of
+/// the screen; windows never go there). Drags on the corner or the strip open it at once.
+const CORNER_ZONE: i32 = 48;
 const DWELL_MS: u64 = 150;
+/// The drop-in/rise-out animation (style.css has the matching durations).
+const RISE_MS: u64 = 200;
+const FIRST_FRAME_MS: u64 = 30;
 /// After the pointer leaves the shelf it goes away after this long. A drag that leaves
 /// (usually: just dropped something) gets longer, so you see the item land.
 const LEAVE_MS: u64 = 350;
@@ -40,6 +43,14 @@ const TOGGLE_MS: u64 = 6000;
 /// The surface's width, including the transparent margin around the frame (room for
 /// its shadow, and the gap to the screen edges, like the bar and dock have).
 const SHELF_WIDTH: i32 = 372;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Trigger {
+    /// The corner square: hover or drag.
+    Corner,
+    /// The thin strip down the left edge: drags only.
+    Edge,
+}
 const ICON_SIZE: i32 = 32;
 
 fn main() -> glib::ExitCode {
@@ -185,6 +196,11 @@ struct Holder {
     app: gtk::Application,
     dir: PathBuf,
     shelf: gtk::ApplicationWindow,
+    /// What slides: the bordered card (the surface itself stays put).
+    frame: gtk::Box,
+    /// Holds the per-show start offset of the slide (the shelf's height).
+    anim_css: gtk::CssProvider,
+    anim_timer: Rc<Timer>,
     list: gtk::Box,
     scroller: gtk::ScrolledWindow,
     empty: gtk::Label,
@@ -269,11 +285,20 @@ impl Holder {
         frame.add_css_class("ht4m-frame");
         frame.append(&card);
         shelf.set_child(Some(&frame));
+        let anim_css = gtk::CssProvider::new();
+        gtk::style_context_add_provider_for_display(
+            &gdk::Display::default().expect("no display"),
+            &anim_css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+        );
 
         let h = Rc::new(Holder {
             app: app.clone(),
             dir,
             shelf,
+            frame,
+            anim_css,
+            anim_timer: Rc::default(),
             list,
             scroller,
             empty,
@@ -442,14 +467,18 @@ impl Holder {
         let current: Vec<gdk::Monitor> =
             (0..monitors.n_items()).filter_map(|i| monitors.item(i).and_downcast()).collect();
         if let Some(m) = self.monitor.borrow().as_ref()
-            && !current.contains(m) {
-                self.shelf.set_visible(false);
-            }
-        let triggers = current.iter().map(|m| self.trigger(m)).collect();
+            && !current.contains(m)
+        {
+            self.shelf.set_visible(false);
+        }
+        let triggers = current
+            .iter()
+            .flat_map(|m| [self.trigger(m, Trigger::Corner), self.trigger(m, Trigger::Edge)])
+            .collect();
         *self.triggers.borrow_mut() = triggers;
     }
 
-    fn trigger(self: &Rc<Self>, monitor: &gdk::Monitor) -> gtk::ApplicationWindow {
+    fn trigger(self: &Rc<Self>, monitor: &gdk::Monitor, kind: Trigger) -> gtk::ApplicationWindow {
         let t = gtk::ApplicationWindow::builder().application(&self.app).css_classes(["ht4m-trigger"]).build();
         t.init_layer_shell();
         t.set_layer(Layer::Overlay);
@@ -459,95 +488,105 @@ impl Holder {
         t.set_anchor(Edge::Left, true);
         t.set_exclusive_zone(-1);
         t.set_monitor(Some(monitor));
-        let height = strip_height(monitor);
+        let (width, height) = match kind {
+            Trigger::Corner => (CORNER_ZONE, CORNER_ZONE),
+            Trigger::Edge => (STRIP_WIDTH, strip_height(monitor)),
+        };
         // Needs a child of exactly this size: a GTK window without one is 200×200.
-        let strip = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        strip.set_size_request(STRIP_WIDTH, height);
-        t.set_child(Some(&strip));
-        t.set_default_size(STRIP_WIDTH, height);
+        let fill = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        fill.set_size_request(width, height);
+        t.set_child(Some(&fill));
+        t.set_default_size(width, height);
 
         let w = Rc::downgrade(self);
-        let m = monitor.clone();
-        let corner = move |h: &Rc<Holder>, y: f64| {
-            if y > CORNER || h.shelf.is_visible() {
-                h.dwell.cancel();
-            } else if !h.dwell.running() {
-                let (w, m) = (Rc::downgrade(h), m.clone());
-                h.dwell.start(DWELL_MS, move || {
-                    if let Some(h) = w.upgrade() {
-                        h.show(&m, UNTOUCHED_MS);
-                    }
-                });
-            }
-        };
-        let corner = Rc::new(corner);
-        let hover = gtk::EventControllerMotion::new();
-        hover.connect_enter({
-            let (w, corner) = (w.clone(), corner.clone());
-            move |_, _, y| {
-                if let Some(h) = w.upgrade() {
-                    corner(&h, y);
+        if kind == Trigger::Corner {
+            // Resting anywhere in the corner square opens it.
+            let hover = gtk::EventControllerMotion::new();
+            let m = monitor.clone();
+            hover.connect_enter(move_with(&w, move |h| {
+                if !h.shown() && !h.dwell.running() {
+                    let (w, m) = (Rc::downgrade(h), m.clone());
+                    h.dwell.start(DWELL_MS, move || {
+                        if let Some(h) = w.upgrade() {
+                            h.show(&m, UNTOUCHED_MS);
+                        }
+                    });
                 }
-            }
-        });
-        hover.connect_motion({
-            let w = w.clone();
-            move |_, _, y| {
-                if let Some(h) = w.upgrade() {
-                    corner(&h, y);
-                }
-            }
-        });
-        hover.connect_leave(with(&w, |h| h.dwell.cancel()));
-        t.add_controller(hover);
+            }));
+            hover.connect_leave(with(&w, |h| h.dwell.cancel()));
+            t.add_controller(hover);
+        }
 
-        // Something from another app is being dragged onto the edge: open right away.
+        // Something from another app is being dragged onto the corner or the edge: open
+        // right away.
         let drag_over = gtk::DropControllerMotion::new();
         let m = monitor.clone();
         drag_over.connect_enter(move |_, _, _| {
             if let Some(h) = w.upgrade()
-                && !h.dragging_out.get() {
-                    h.show(&m, UNTOUCHED_MS);
-                }
+                && !h.dragging_out.get()
+            {
+                h.show(&m, UNTOUCHED_MS);
+            }
         });
         t.add_controller(drag_over);
-        t.add_controller(self.drop_target()); // a drop that lands on the strip itself
+        t.add_controller(self.drop_target()); // a drop that lands on the trigger itself
 
         t.present();
         t
     }
 
+    /// Out, and not on its way back in.
+    fn shown(&self) -> bool {
+        self.shelf.is_visible() && !self.frame.has_css_class("away")
+    }
+
     fn show(self: &Rc<Self>, monitor: &gdk::Monitor, untouched_ms: u64) {
         self.dwell.cancel();
-        if self.shelf.is_visible() {
-            if self.monitor.borrow().as_ref() == Some(monitor) {
-                self.hide_timer.cancel();
-                return;
+        let w = Rc::downgrade(self);
+        let untouched = move || {
+            if let Some(h) = w.upgrade() {
+                h.hide();
             }
-            self.shelf.set_visible(false);
+        };
+        if self.shelf.is_visible() && self.monitor.borrow().as_ref() == Some(monitor) {
+            // Already out, or still rising away: drop back down from where it is.
+            self.hide_timer.cancel();
+            if self.frame.has_css_class("away") {
+                self.anim_timer.cancel();
+                self.frame.remove_css_class("away");
+                self.hide_timer.start(untouched_ms, untouched);
+            }
+            return;
         }
+        self.anim_timer.cancel();
+        self.shelf.set_visible(false);
         *self.monitor.borrow_mut() = Some(monitor.clone());
         self.shelf.set_monitor(Some(monitor));
         self.shelf.set_layer(Layer::Overlay);
         self.reload();
+        // Start above the screen's top edge, then let the CSS transition drop it in.
+        let height = self.shelf.default_size().1;
+        self.anim_css.load_from_string(&format!(".ht4m-frame.away {{ transform: translateY(-{height}px); }}"));
+        self.frame.add_css_class("away");
         self.shelf.present();
-        let w = Rc::downgrade(self);
-        self.hide_timer.start(untouched_ms, move || {
-            if let Some(h) = w.upgrade() {
-                h.hide();
-            }
-        });
+        let frame = self.frame.clone();
+        self.anim_timer.start(FIRST_FRAME_MS, move || frame.remove_css_class("away"));
+        self.hide_timer.start(untouched_ms, untouched);
     }
 
+    /// Rise back up, then unmap.
     fn hide(&self) {
         self.hide_timer.cancel();
-        if !self.dragging_out.get() {
-            self.shelf.set_visible(false);
+        if self.dragging_out.get() || !self.shown() {
+            return;
         }
+        self.frame.add_css_class("away");
+        let shelf = self.shelf.clone();
+        self.anim_timer.start(RISE_MS, move || shelf.set_visible(false));
     }
 
     fn toggle(self: &Rc<Self>) {
-        if self.shelf.is_visible() {
+        if self.shown() {
             self.hide();
             return;
         }
@@ -563,7 +602,7 @@ impl Holder {
 
     /// The pointer (or a drag) left the shelf.
     fn left(self: &Rc<Self>, ms: u64) {
-        if self.dragging_out.get() || !self.shelf.is_visible() {
+        if self.dragging_out.get() || !self.shown() {
             return;
         }
         let w = Rc::downgrade(self);

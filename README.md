@@ -8,7 +8,7 @@ through Nautilus in every upload dialog.
 
 | Do this | What happens |
 | --- | --- |
-| Push the pointer into the very top-left corner | The shelf slides out (after a 150 ms pause, so passing by doesn't trigger it) |
+| Rest the pointer in the top-left corner (a loose 48 px square) | The shelf drops down (after a 150 ms pause, so passing by doesn't trigger it) |
 | Drag files or folders onto the top part of the left screen edge | The shelf opens at once, and you drop them on it |
 | `+` / folder button | Opens the file chooser, so you can pick files or folders by browsing |
 | Drag an item off the shelf into any app | The app gets the real file; the item stays on the shelf |
@@ -19,7 +19,7 @@ through Nautilus in every upload dialog.
 | Clear button | Lets go of everything |
 | Open-folder button | Opens the shelf folder in Nautilus |
 
-The shelf goes away a moment after the pointer leaves it. While you drag an item out, it
+The shelf rises back out a moment after the pointer leaves it. While you drag an item out, it
 drops behind your windows so they can take the drop.
 
 `holdthis4me --toggle` opens or closes it from a keybind, if you want one.
@@ -64,16 +64,17 @@ shelf folder is never touched by installs.
 Two lines in the Hyprland config hook it up (already added):
 
 - `~/.config/hypr/conf/autostart.lua` starts `holdthis4me-start`. That runs the binary through `ensure-running`: one instance, health-checked over D-Bus, no restart loops.
-- `~/.config/hypr/custom.lua` loads `hypr/holdthis4me.lua`, which slides the shelf in from the left and turns off animation for the trigger strip.
+- `~/.config/hypr/custom.lua` loads `hypr/holdthis4me.lua`. It turns off Hyprland's own layer animations for holdthis4me. The shelf animates itself with a CSS transition: it drops in on the "overshot" curve your window animations use, and rises out faster. That way it doesn't depend on the animation preset.
 
 ## How it works
 
-Each screen gets two layer surfaces:
+Each screen gets three layer surfaces:
 
-- **Trigger:** an invisible 2 px strip down the left edge, 45% of the screen tall. Plain hover counts only in its top 8 px (the corner). A drag counts anywhere on the strip.
+- **Corner:** an invisible 48 px square at the very corner. Hover or drag opens the shelf. It sits in empty space, because the bar reserves the top of the screen.
+- **Edge:** an invisible 2 px strip down the left edge, 45% of the screen tall. Only drags open the shelf here.
 - **Shelf:** mapped only while it's out. It covers the screen edge and is at least as tall as the strip, so a drag that opened it lands on it.
 
-The trigger isn't fully transparent; it's 1% black. GTK never commits a frame for a surface
+The triggers aren't fully transparent; they're 1% black. GTK never commits a frame for a surface
 with nothing to draw, so Hyprland would never map it.
 
 Source: `src/main.rs` (UI, triggers, drag and drop, theme), `src/shelf.rs` (the link folder,
