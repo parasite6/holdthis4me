@@ -35,7 +35,7 @@ folder in Nautilus and add or delete links there; the shelf follows.
 
 Safety rules:
 
-- Drags out offer **copy** only. Dropping into Nautilus copies the file; it never moves your original.
+- Drags out offer **copy** only. **But on Hyprland, a shelf item dropped into a Nautilus folder is probably *moved* there.** Hyprland tells the receiving app that every drag is a "move", whatever the source offers, so Nautilus moves the original out of its folder. Nothing is deleted, but the file changes place and its shelf item shows as missing. Holding **Ctrl** while dropping should make Nautilus copy instead. Not yet tested; check with a throwaway file before relying on it. Upload boxes and chat apps only read the file, so they're unaffected.
 - Drops in ask for **copy**, but "move" is let in as well. Hyprland ignores what the receiving app asks for and settles every drag as "move" (it's in the log: `drop, settled as MOVE`). A copy-only target therefore takes nothing at all, and that's why drops first failed. holdthis4me only ever adds a link, and file managers don't delete on a "move" into another app; tested with a throwaway file, which stayed put. One caveat: a browser may delete text dragged *out of a text box you're typing in* when the drag is a "move". Drag text from the page itself.
 - Letting go deletes only the link, never the file it points to. It refuses anything in the folder that isn't a symlink (there's a test for this).
 - Every change goes through a handle on the shelf folder itself. The folder is opened without following symlinks, and only if it's a real directory you own that nobody else can write to. If the shelf path were ever swapped for a symlink to another folder, nothing there could be listed, added or removed; "Clear" could never sweep your real links.
@@ -147,3 +147,24 @@ Log: `journalctl --user -t holdthis4me`. The start script runs it through `syste
 - **Name squatting:** any program running as you could claim the D-Bus name first, or call `--toggle`. That's the same trust level as you, so it isn't guarded.
 - **Hung mounts:** a background check stuck on a hung mount keeps one GIO worker thread busy until the mount answers or times out. A file whose check is still running is never checked again, so reopening the shelf doesn't pile up more stuck checks.
 - **Refused folder:** if the shelf folder is refused, the shelf says why in place of "Drop files or folders here".
+
+## Audit 2 (2026-10-11): notes, source apps, Hyprland drops
+
+**Found:**
+
+- **Nautilus moves rather than copies** a shelf item dragged into one of its folders, because Hyprland settles every drag as a move. holdthis4me can't override this. It's documented above with the Ctrl workaround, pending a test with a throwaway file.
+
+**Fixed:**
+
+- **Reading a note** checked for a symlink and then opened the file, so a symlink swapped in between could have leaked another file into a drag as text. It now opens without following symlinks, and only reads regular files.
+- **Note cleanup** compared paths as text, so a home path spelled differently (a symlinked home folder) would have made held notes look orphaned. It now compares real locations, and keeps a note whenever it's unsure.
+- **Per-drop debug logging** is removed. Refusals and errors are still logged.
+
+**Checked and fine:**
+
+- **Note names:** slashes, control characters and leading dots are stripped, so a name can't leave the folder, hide itself or exceed 255 bytes.
+- **Writing notes:** files are created new, never overwriting and never through a symlink.
+- **Hyprland lookup:** the instance ID is validated, replies are capped at 64 KB, and there's a 200 ms timeout.
+- **Logs:** dropped text is never written to the log.
+- **Own drags:** an item dragged back onto the shelf is recognised as a duplicate.
+- **Layout warning:** the old "needs at least 452" warning came from before the label-wrap fix; the current build logs nothing at startup.

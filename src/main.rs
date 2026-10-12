@@ -435,12 +435,10 @@ impl Holder {
         target.connect_enter(|_, _, _| gdk::DragAction::COPY);
         target.connect_motion(|_, _, _| gdk::DragAction::COPY);
         let w = Rc::downgrade(self);
-        target.connect_drop(move |t, value, _, _| {
+        target.connect_drop(move |_, value, _, _| {
             // Hyprland settles every drag as MOVE whatever we ask for. Taken anyway: we only
             // ever add a link, and file managers don't delete on a MOVE into another app
-            // (it's what every drag on Hyprland already is). Logged for the record.
-            let settled = t.current_drop().map(|d| d.actions()).unwrap_or(gdk::DragAction::empty());
-            eprintln!("holdthis4me: drop, settled as {settled:?}");
+            // (it's what every drag on Hyprland already is).
             let Some(h) = w.upgrade() else { return false };
             let took = if let Ok(files) = value.get::<gdk::FileList>() {
                 // Local files are held as they are; a web address in the list (a link

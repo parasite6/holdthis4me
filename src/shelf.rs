@@ -335,11 +335,19 @@ pub fn write_note(notes: &Path, note: &Note) -> io::Result<PathBuf> {
 
 /// The note a held target is, if it's one of ours (a file directly in the notes folder).
 pub fn read_note(notes: &Path, target: &Path) -> Option<Note> {
-    if target.parent() != Some(notes) || fs::symlink_metadata(target).ok()?.file_type().is_symlink() {
+    if target.parent() != Some(notes) {
+        return None;
+    }
+    // Opened without following a symlink, and only a regular file is read: a note
+    // swapped for a link to some other file can't leak that file into a drag.
+    let file = std::os::unix::fs::OpenOptionsExt::custom_flags(fs::OpenOptions::new().read(true), libc::O_NOFOLLOW)
+        .open(target)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
         return None;
     }
     let mut body = Vec::new();
-    io::Read::read_to_end(&mut io::Read::take(fs::File::open(target).ok()?, NOTE_MAX as u64 + 1), &mut body).ok()?;
+    io::Read::read_to_end(&mut io::Read::take(file, NOTE_MAX as u64 + 1), &mut body).ok()?;
     let body = String::from_utf8(body).ok()?;
     if target.extension().is_some_and(|e| e == "url") {
         let url = body.lines().find_map(|l| l.strip_prefix("URL="))?.trim().to_owned();
@@ -411,11 +419,23 @@ pub fn prune_notes(shelf: &Path, notes: &Path) -> io::Result<usize> {
     // A refused shelf lists as empty, which would make every note look orphaned.
     usable(shelf)?;
     let fd = open_dir(notes)?;
-    let held: HashSet<PathBuf> = list(shelf).into_iter().map(|i| i.target).collect();
+    // Held = some item points at a file of that name in this same folder, compared by
+    // real location, so a home path spelled differently (a symlinked home) can't make
+    // held notes look orphaned. An item whose folder can't be resolved holds its name
+    // anyway: when unsure, keep.
+    let real_notes = fs::canonicalize(notes)?;
+    let held: HashSet<std::ffi::OsString> = list(shelf)
+        .into_iter()
+        .filter(|i| {
+            let parent = i.target.parent().map(fs::canonicalize);
+            !matches!(parent, Some(Ok(p)) if p != real_notes)
+        })
+        .filter_map(|i| i.target.file_name().map(|n| n.to_owned()))
+        .collect();
     let mut pruned = 0;
     for entry in fs::read_dir(notes)?.flatten() {
         let name = entry.file_name();
-        if name.as_bytes().starts_with(STAGING.as_bytes()) || held.contains(&notes.join(&name)) {
+        if name.as_bytes().starts_with(STAGING.as_bytes()) || held.contains(&name) {
             continue;
         }
         if entry.file_type().is_ok_and(|t| t.is_file()) && delete_regular_at(&fd, &cstr(&name)?).is_ok() {
@@ -623,6 +643,13 @@ mod tests {
         let t2 = write_note(&notes, &Note::Text(text.into())).unwrap();
         assert_ne!(t, t2, "never overwrites");
 
+        // A note swapped for a symlink to another file is never read.
+        let secret = root.join("secret.txt");
+        fs::write(&secret, "do not leak").unwrap();
+        let swapped = notes.join("swapped.txt");
+        std::os::unix::fs::symlink(&secret, &swapped).unwrap();
+        assert_eq!(read_note(&notes, &swapped), None);
+
         // A .url file whose URL isn't a web address isn't treated as a link.
         let bad = notes.join("bad.url");
         fs::write(&bad, "[InternetShortcut]\nURL=file:///etc/passwd\n").unwrap();
@@ -656,6 +683,15 @@ mod tests {
         assert_eq!(prune_notes(&shelf, &notes).unwrap(), 1);
         assert!(held.exists() && !orphan.exists());
         assert!(fs::symlink_metadata(&sneaky).is_ok() && notes.join("dir.txt").exists() && outside.exists());
+
+        // Held through a differently spelled path (a symlinked home): still held.
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&notes, &alias).unwrap();
+        let via_alias = write_note(&notes, &Note::Text("aliased".into())).unwrap();
+        let alias_target = alias.join(via_alias.file_name().unwrap());
+        std::os::unix::fs::symlink(&alias_target, shelf.join("aliased-link")).unwrap();
+        assert_eq!(prune_notes(&shelf, &notes).unwrap(), 0);
+        assert!(via_alias.exists());
 
         // If the shelf folder is refused (lists as empty), nothing is pruned.
         fs::set_permissions(&shelf, fs::Permissions::from_mode(0o777)).unwrap();
