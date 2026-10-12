@@ -1,15 +1,17 @@
 //! holdthis4me: a shelf for files and folders on the top-left of the screen.
 //!
-//! Hover the very top-left corner, or drag something onto the top part of the left screen
-//! edge, and the shelf slides out. Drop files in; later drag them out into any app. The
-//! shelf only holds links (src/shelf.rs): nothing is copied and nothing lives in memory.
+//! Touch the top or left screen border by the corner, or drag something there, and the
+//! shelf drops out. Drop files in; later drag them out into any app. The shelf only holds
+//! links (src/shelf.rs): nothing is copied and nothing lives in memory.
 //!
-//! Two layer surfaces per screen: an invisible 2 px strip on the left edge that's always
-//! there (the trigger), and the shelf itself, mapped only while it's out.
+//! Layer surfaces: two invisible 2 px trigger strips per screen (top and left border), and
+//! the shelf, which stays mapped and is slid away, transparent and click-through while
+//! hidden.
 
 mod shelf;
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::time::Duration;
@@ -36,6 +38,8 @@ const AFTER_DROP_MS: u64 = 1200;
 /// Opened but never touched (e.g. after the file picker, or --toggle): go away anyway.
 const UNTOUCHED_MS: u64 = 2500;
 const TOGGLE_MS: u64 = 6000;
+/// "Clear" needs a second click within this long.
+const CLEAR_ARM_MS: u64 = 2500;
 
 /// The surface's width, including the transparent margin around the frame (room for
 /// its shadow, and the gap to the screen edges, like the bar and dock have).
@@ -51,6 +55,7 @@ enum Trigger {
     Left,
 }
 const ICON_SIZE: i32 = 32;
+const CLEAR_TIP: &str = "Let go of everything (the files stay where they are)";
 
 fn main() -> glib::ExitCode {
     if std::env::var("WAYLAND_DISPLAY").map_or(true, |v| v.is_empty()) {
@@ -185,6 +190,10 @@ impl Timer {
             id.remove();
         }
     }
+
+    fn is_running(&self) -> bool {
+        self.0.borrow().is_some()
+    }
 }
 
 struct Holder {
@@ -201,8 +210,14 @@ struct Holder {
     empty: gtk::Label,
     count: gtk::Label,
     drag_all: gtk::Box,
-    /// Real paths of everything held that still exists (what "Drag all" hands out).
+    /// Real paths of everything held (what "Drag all" hands out, minus `missing`).
     held: RefCell<Vec<PathBuf>>,
+    /// Held targets found to be gone. Filled in by background checks after each reload;
+    /// `generation` tells a late check that a newer reload has replaced its row.
+    missing: RefCell<HashSet<PathBuf>>,
+    generation: Cell<u64>,
+    /// "Clear" was clicked once and is waiting for the confirming second click.
+    clear_armed: Rc<Timer>,
     triggers: RefCell<Vec<gtk::ApplicationWindow>>,
     /// The screen the shelf is on (or was last on).
     monitor: RefCell<Option<gdk::Monitor>>,
@@ -222,8 +237,9 @@ struct Holder {
 impl Holder {
     fn new(app: &gtk::Application) -> Rc<Self> {
         let dir = shelf::default_dir();
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            eprintln!("holdthis4me: can't create {}: {e}", dir.display());
+        if let Err(e) = shelf::prepare(&dir) {
+            // Nothing will be added or removed while this stands (shelf.rs refuses).
+            eprintln!("holdthis4me: shelf folder {} unusable: {e}", dir.display());
         }
 
         let shelf = gtk::ApplicationWindow::builder()
@@ -244,7 +260,7 @@ impl Holder {
         let add_files = icon_button("list-add-symbolic", "Add files…");
         let add_folders = icon_button("folder-new-symbolic", "Add folders…");
         let open_shelf = icon_button("folder-open-symbolic", "Open the shelf folder in Files");
-        let clear = icon_button("edit-clear-all-symbolic", "Let go of everything (the files stay where they are)");
+        let clear = icon_button("edit-clear-all-symbolic", CLEAR_TIP);
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         header.add_css_class("ht4m-header");
         for w in [title.upcast_ref::<gtk::Widget>(), count.upcast_ref(), add_files.upcast_ref(),
@@ -302,6 +318,9 @@ impl Holder {
             count,
             drag_all,
             held: RefCell::default(),
+            missing: RefCell::default(),
+            generation: Cell::new(0),
+            clear_armed: Rc::default(),
             triggers: RefCell::default(),
             monitor: RefCell::default(),
             hide_timer: Rc::default(),
@@ -319,14 +338,8 @@ impl Holder {
             show_in_files(&h.app, "ShowFolders", &h.dir);
             h.hide();
         }));
-        clear.connect_clicked(with(&w, |h| {
-            for item in shelf::list(&h.dir) {
-                if let Err(e) = shelf::remove(&h.dir, &item.link) {
-                    eprintln!("holdthis4me: {}: {e}", item.link.display());
-                }
-            }
-            h.reload();
-        }));
+        // Two clicks: the first arms it (highlighted), the second within CLEAR_ARM_MS clears.
+        clear.connect_clicked(with(&w, |h| h.clear_clicked()));
 
         h.wire_shelf();
         // GTK may reset the input region when it lays the window out again; re-apply
@@ -373,8 +386,9 @@ impl Holder {
             let w = w.clone();
             move |_, _, _| {
                 let h = w.upgrade()?;
-                let held = h.held.borrow();
-                (!held.is_empty()).then(|| files_content(&held))
+                let missing = h.missing.borrow();
+                let present: Vec<PathBuf> = h.held.borrow().iter().filter(|p| !missing.contains(*p)).cloned().collect();
+                (!present.is_empty()).then(|| files_content(&present))
             }
         });
         self.drag_source_events(&all, &self.drag_all.clone().upcast());
@@ -388,13 +402,8 @@ impl Holder {
         let w = Rc::downgrade(self);
         target.connect_drop(move |_, value, _, _| {
             let (Some(h), Ok(files)) = (w.upgrade(), value.get::<gdk::FileList>()) else { return false };
-            let mut took = false;
-            for path in files.files().iter().filter_map(|f| f.path()) {
-                match shelf::add(&h.dir, &path) {
-                    Ok(_) => took = true,
-                    Err(e) => eprintln!("holdthis4me: can't hold {}: {e}", path.display()),
-                }
-            }
+            let paths: Vec<PathBuf> = files.files().iter().filter_map(|f| f.path()).collect();
+            let took = h.hold(&paths);
             h.reload();
             took
         });
@@ -477,23 +486,32 @@ impl Holder {
         let monitors = gdk::Display::default().expect("no display").monitors();
         let current: Vec<gdk::Monitor> =
             (0..monitors.n_items()).filter_map(|i| monitors.item(i).and_downcast()).collect();
-        if let Some(m) = self.monitor.borrow().as_ref()
-            && !current.contains(m)
-        {
-            self.shelf.set_visible(false);
-            self.out.set(false);
-        }
         let triggers = current
             .iter()
             .flat_map(|m| [self.trigger(m, Trigger::Top), self.trigger(m, Trigger::Left)])
             .collect();
         *self.triggers.borrow_mut() = triggers;
+        // Map the shelf again after the new strips, so it stacks above them, and never on
+        // a screen that's gone. (Closes it if it was open.)
+        if !self.dragging_out.get() {
+            self.out.set(false);
+            self.hide_timer.cancel();
+            self.anim_timer.cancel();
+            self.shelf.set_visible(false);
+            // Bound first: a borrow in the `if let` would live through place()'s borrow_mut.
+            let current = self.monitor.borrow().clone();
+            if let Some(m) = usable_monitor(current) {
+                self.place(&m);
+            }
+        }
     }
 
     fn trigger(self: &Rc<Self>, monitor: &gdk::Monitor, kind: Trigger) -> gtk::ApplicationWindow {
         let t = gtk::ApplicationWindow::builder().application(&self.app).css_classes(["ht4m-trigger"]).build();
         t.init_layer_shell();
-        t.set_layer(Layer::Overlay);
+        // Top, not Overlay: above normal windows, but under fullscreen ones, so a game or
+        // video never gets the shelf popping over it (or a surface composited on top).
+        t.set_layer(Layer::Top);
         t.set_keyboard_mode(KeyboardMode::None);
         t.set_namespace(Some("holdthis4me-trigger"));
         t.set_anchor(Edge::Top, true);
@@ -552,6 +570,10 @@ impl Holder {
         self.shelf.set_visible(false);
         *self.monitor.borrow_mut() = Some(monitor.clone());
         self.shelf.set_monitor(Some(monitor));
+        // Hidden, it waits on the Top layer: under fullscreen windows (nothing drawn over a
+        // game), but never covered by normal ones. A fully covered surface may stop getting
+        // frame callbacks, which would stall the next open.
+        self.shelf.set_layer(Layer::Top);
         self.frame.add_css_class("away");
         self.fit();
         self.shelf.present();
@@ -568,6 +590,9 @@ impl Holder {
     }
 
     fn show(self: &Rc<Self>, monitor: &gdk::Monitor, untouched_ms: u64) {
+        if !monitor.is_valid() {
+            return; // unplugged since the caller looked it up
+        }
         let w = Rc::downgrade(self);
         let untouched = move || {
             if let Some(h) = w.upgrade() {
@@ -612,18 +637,60 @@ impl Holder {
         self.out.set(false);
         self.frame.add_css_class("away");
         self.set_clickable(false);
-        // Back on top once it's out of sight (a drag-out moved it below windows).
+        if self.clear_armed.is_running() {
+            self.clear_armed.cancel();
+            let b = self.clear_button();
+            b.remove_css_class("armed");
+            b.set_tooltip_text(Some(CLEAR_TIP));
+        }
+        // Once it's out of sight, wait on the Top layer again (see place()).
         let shelf = self.shelf.clone();
-        self.anim_timer.start(RISE_MS, move || shelf.set_layer(Layer::Overlay));
+        self.anim_timer.start(RISE_MS, move || shelf.set_layer(Layer::Top));
     }
 
     /// Map the hidden shelf right away on the first screen, so the first open is as
     /// quick as the rest.
     fn toggle_ready(&self) {
-        let monitors = gdk::Display::default().expect("no display").monitors();
-        if let Some(m) = monitors.item(0).and_downcast::<gdk::Monitor>() {
+        if let Some(m) = usable_monitor(None) {
             self.place(&m);
         }
+    }
+
+    /// Hold these paths; true if any were taken (or were already held).
+    fn hold(&self, paths: &[PathBuf]) -> bool {
+        let mut took = false;
+        for (path, result) in paths.iter().zip(shelf::add_all(&self.dir, paths)) {
+            match result {
+                Ok(_) => took = true,
+                Err(e) => eprintln!("holdthis4me: can't hold {}: {e}", path.display()),
+            }
+        }
+        took
+    }
+
+    fn clear_clicked(self: &Rc<Self>) {
+        let button = self.clear_button();
+        if !self.clear_armed.is_running() {
+            button.add_css_class("armed");
+            button.set_tooltip_text(Some("Click again to let go of everything"));
+            let b = button.downgrade();
+            self.clear_armed.start(CLEAR_ARM_MS, move || {
+                if let Some(b) = b.upgrade() {
+                    b.remove_css_class("armed");
+                    b.set_tooltip_text(Some(CLEAR_TIP));
+                }
+            });
+            return;
+        }
+        self.clear_armed.cancel();
+        button.remove_css_class("armed");
+        button.set_tooltip_text(Some(CLEAR_TIP));
+        for item in shelf::list(&self.dir) {
+            if let Err(e) = shelf::remove(&self.dir, &item.link) {
+                eprintln!("holdthis4me: {}: {e}", item.link.display());
+            }
+        }
+        self.reload();
     }
 
     fn toggle(self: &Rc<Self>) {
@@ -631,12 +698,9 @@ impl Holder {
             self.hide();
             return;
         }
-        let first = || {
-            let monitors = gdk::Display::default()?.monitors();
-            monitors.item(0).and_downcast::<gdk::Monitor>()
-        };
-        let m = self.monitor.borrow().clone().or_else(first);
-        if let Some(m) = m {
+        // Bound first: a borrow in the `if let` would live through place()'s borrow_mut.
+            let current = self.monitor.borrow().clone();
+            if let Some(m) = usable_monitor(current) {
             self.show(&m, TOGGLE_MS);
         }
     }
@@ -665,16 +729,14 @@ impl Holder {
         let w = Rc::downgrade(self);
         let done = move |result: Result<gio::ListModel, glib::Error>| {
             let (Some(h), Ok(chosen)) = (w.upgrade(), result) else { return };
-            for path in (0..chosen.n_items())
+            let paths: Vec<PathBuf> = (0..chosen.n_items())
                 .filter_map(|i| chosen.item(i).and_downcast::<gio::File>())
                 .filter_map(|f| f.path())
-            {
-                if let Err(e) = shelf::add(&h.dir, &path) {
-                    eprintln!("holdthis4me: can't hold {}: {e}", path.display());
-                }
-            }
-            if let Some(m) = &monitor {
-                h.show(m, UNTOUCHED_MS); // a glimpse of what was added
+                .collect();
+            h.hold(&paths);
+            // The screen may have gone while the chooser was open.
+            if let Some(m) = usable_monitor(monitor.clone()) {
+                h.show(&m, UNTOUCHED_MS); // a glimpse of what was added
             }
         };
         if folders {
@@ -693,11 +755,13 @@ impl Holder {
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
+        self.generation.set(self.generation.get() + 1);
+        self.missing.borrow_mut().clear();
         let items = shelf::list(&self.dir);
         for item in &items {
             self.list.append(&self.row(item));
         }
-        let held: Vec<PathBuf> = items.iter().filter(|i| i.exists).map(|i| i.target.clone()).collect();
+        let held: Vec<PathBuf> = items.iter().map(|i| i.target.clone()).collect();
         self.empty.set_visible(items.is_empty());
         self.scroller.set_visible(!items.is_empty());
         self.drag_all.set_visible(held.len() > 1);
@@ -723,12 +787,17 @@ impl Holder {
         self.anim_css.load_from_string(&format!(".ht4m-frame.away {{ transform: translateY(-{height}px); }}"));
     }
 
+    /// One held item. It's drawn straight away as present with a generic icon; a
+    /// background check then fills in its real icon or thumbnail, or marks it missing.
+    /// (Checking on the spot would hang the whole shelf on a dead network mount.)
     fn row(self: &Rc<Self>, item: &shelf::Item) -> gtk::Box {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         row.add_css_class("ht4m-item");
         row.set_tooltip_text(Some(&item.target.to_string_lossy()));
 
-        let icon = icon_for(&item.target, item.exists);
+        let icon = gtk::Image::from_icon_name("text-x-generic");
+        icon.set_pixel_size(ICON_SIZE);
+        icon.add_css_class("ht4m-icon");
         let name = gtk::Label::builder()
             .label(item.target.file_name().map_or_else(|| item.target.to_string_lossy(), |n| n.to_string_lossy()))
             .xalign(0.0)
@@ -737,7 +806,7 @@ impl Holder {
             .build();
         let parent = item.target.parent().map(tilde).unwrap_or_default();
         let place = gtk::Label::builder()
-            .label(if item.exists { parent } else { format!("missing (was in {parent})") })
+            .label(parent.as_str())
             .xalign(0.0)
             .ellipsize(pango::EllipsizeMode::Start)
             .css_classes(["ht4m-place"])
@@ -751,18 +820,14 @@ impl Holder {
         row.append(&texts);
 
         let w = Rc::downgrade(self);
-        if item.exists {
-            let reveal = icon_button("find-location-symbolic", "Show in Files");
-            reveal.add_css_class("ht4m-itembtn");
-            let target = item.target.clone();
-            reveal.connect_clicked(with(&w, move |h| {
-                show_in_files(&h.app, "ShowItems", &target);
-                h.hide();
-            }));
-            row.append(&reveal);
-        } else {
-            row.add_css_class("missing");
-        }
+        let reveal = icon_button("find-location-symbolic", "Show in Files");
+        reveal.add_css_class("ht4m-itembtn");
+        let target = item.target.clone();
+        reveal.connect_clicked(with(&w, move |h| {
+            show_in_files(&h.app, "ShowItems", &target);
+            h.hide();
+        }));
+        row.append(&reveal);
         let let_go = icon_button("window-close-symbolic", "Let go (the file stays where it is)");
         let_go.add_css_class("ht4m-itembtn");
         let link = item.link.clone();
@@ -774,27 +839,72 @@ impl Holder {
         }));
         row.append(&let_go);
 
-        if item.exists {
-            let source = gtk::DragSource::new();
-            source.set_actions(gdk::DragAction::COPY);
-            let target = item.target.clone();
-            source.connect_prepare(move |_, _, _| Some(files_content(std::slice::from_ref(&target))));
-            self.drag_source_events(&source, icon.upcast_ref());
-            row.add_controller(source);
+        // Drag out and double-click open, unless the check finds it gone.
+        let source = gtk::DragSource::new();
+        source.set_actions(gdk::DragAction::COPY);
+        let target = item.target.clone();
+        let wp = w.clone();
+        source.connect_prepare(move |_, _, _| {
+            let h = wp.upgrade()?;
+            let gone = h.missing.borrow().contains(&target);
+            (!gone).then(|| files_content(std::slice::from_ref(&target)))
+        });
+        self.drag_source_events(&source, icon.upcast_ref());
+        row.add_controller(source);
 
-            let click = gtk::GestureClick::new();
-            let target = item.target.clone();
-            click.connect_pressed(move |_, n, _, _| {
-                if n == 2 {
-                    open(&target);
-                    if let Some(h) = w.upgrade() {
-                        h.hide();
-                    }
+        let click = gtk::GestureClick::new();
+        let target = item.target.clone();
+        let wc = w.clone();
+        click.connect_pressed(move |_, n, _, _| {
+            let Some(h) = wc.upgrade() else { return };
+            if n == 2 && !h.missing.borrow().contains(&target) {
+                open(&target);
+                h.hide();
+            }
+        });
+        row.add_controller(click);
+
+        let generation = self.generation.get();
+        let target = item.target.clone();
+        let (row_w, icon_w, place_w, reveal_w) = (row.downgrade(), icon.downgrade(), place.downgrade(), reveal.downgrade());
+        gio::File::for_path(&item.target).query_info_async(
+            "standard::icon,thumbnail::path,thumbnail::is-valid",
+            gio::FileQueryInfoFlags::NONE,
+            glib::Priority::DEFAULT_IDLE,
+            None::<&gio::Cancellable>,
+            move |result| {
+                let Some(h) = w.upgrade() else { return };
+                if h.generation.get() != generation {
+                    return; // rebuilt since: this row is gone
                 }
-            });
-            row.add_controller(click);
-        }
+                let (Some(row), Some(icon), Some(place), Some(reveal)) =
+                    (row_w.upgrade(), icon_w.upgrade(), place_w.upgrade(), reveal_w.upgrade())
+                else {
+                    return;
+                };
+                match result {
+                    Ok(info) => set_icon(&icon, &info),
+                    Err(e) if e.matches(gio::IOErrorEnum::NotFound) => {
+                        h.missing.borrow_mut().insert(target.clone());
+                        row.add_css_class("missing");
+                        icon.set_icon_name(Some("dialog-question-symbolic"));
+                        place.set_label(&format!("missing (was in {parent})"));
+                        reveal.set_visible(false);
+                        let present = h.held.borrow().iter().filter(|p| !h.missing.borrow().contains(*p)).count();
+                        h.drag_all.set_visible(present > 1);
+                    }
+                    Err(_) => {} // unreadable, not gone: keep the generic icon
+                }
+            },
+        );
         row
+    }
+
+    fn clear_button(&self) -> gtk::Button {
+        // The header's last child (see new()).
+        let card = self.frame.first_child().expect("card");
+        let header = card.first_child().expect("header");
+        header.last_child().and_downcast::<gtk::Button>().expect("clear button")
     }
 }
 
@@ -828,32 +938,21 @@ fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {
 }
 
 /// The thumbnail Nautilus already made for it if there is one, else its type's icon.
-fn icon_for(path: &Path, exists: bool) -> gtk::Image {
-    let image = if !exists {
-        gtk::Image::from_icon_name("dialog-question-symbolic")
-    } else {
-        let info = gio::File::for_path(path).query_info(
-            "standard::icon,thumbnail::path,thumbnail::is-valid",
-            gio::FileQueryInfoFlags::NONE,
-            None::<&gio::Cancellable>,
-        );
-        match info {
-            Ok(info) => {
-                let thumb = info
-                    .attribute_byte_string("thumbnail::path")
-                    .filter(|_| !info.has_attribute("thumbnail::is-valid") || info.boolean("thumbnail::is-valid"));
-                match (thumb, info.icon()) {
-                    (Some(t), _) => gtk::Image::from_file(t.as_str()),
-                    (None, Some(icon)) => gtk::Image::from_gicon(&icon),
-                    (None, None) => gtk::Image::from_icon_name("text-x-generic"),
-                }
-            }
-            Err(_) => gtk::Image::from_icon_name("text-x-generic"),
-        }
-    };
-    image.set_pixel_size(ICON_SIZE);
-    image.add_css_class("ht4m-icon");
-    image
+fn set_icon(image: &gtk::Image, info: &gio::FileInfo) {
+    let valid = !info.has_attribute("thumbnail::is-valid") || info.boolean("thumbnail::is-valid");
+    match (info.attribute_byte_string("thumbnail::path").filter(|_| valid), info.icon()) {
+        (Some(t), _) => image.set_from_file(Some(t.as_str())),
+        (None, Some(icon)) => image.set_from_gicon(&icon),
+        (None, None) => {}
+    }
+}
+
+/// The shelf's screen if it's still connected, else the first one there is.
+fn usable_monitor(preferred: Option<gdk::Monitor>) -> Option<gdk::Monitor> {
+    preferred.filter(|m| m.is_valid()).or_else(|| {
+        let monitors = gdk::Display::default()?.monitors();
+        monitors.item(0).and_downcast::<gdk::Monitor>()
+    })
 }
 
 /// What a drag hands to the app it's dropped on: the real files (as text/uri-list, plus
@@ -863,12 +962,17 @@ fn files_content(paths: &[PathBuf]) -> gdk::ContentProvider {
     gdk::ContentProvider::for_value(&gdk::FileList::from_array(&files).to_value())
 }
 
+/// Open in its default app. Asynchronous: finding the app reads the file, which could
+/// hang on a dead mount.
 fn open(path: &Path) {
     let ctx = gdk::Display::default().map(|d| d.app_launch_context());
     let uri = gio::File::for_path(path).uri();
-    if let Err(e) = gio::AppInfo::launch_default_for_uri(&uri, ctx.as_ref()) {
-        eprintln!("holdthis4me: can't open {}: {e}", path.display());
-    }
+    let path = path.to_owned();
+    gio::AppInfo::launch_default_for_uri_async(&uri, ctx.as_ref(), None::<&gio::Cancellable>, move |result| {
+        if let Err(e) = result {
+            eprintln!("holdthis4me: can't open {}: {e}", path.display());
+        }
+    });
 }
 
 /// Ask the file manager (Nautilus) to show a file selected in its folder (`ShowItems`)

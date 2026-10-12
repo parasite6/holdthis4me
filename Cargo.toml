@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 gtk = { version = "0.11.5", package = "gtk4", features = ["v4_14"] }
 gtk4-layer-shell = "0.8.1"
+libc = "0.2.190"
 
 [profile.release]
 strip = true

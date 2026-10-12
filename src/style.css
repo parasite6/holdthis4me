@@ -90,6 +90,12 @@ window.ht4m:drop(active) .ht4m-card {
   background-color: alpha(@ht_primary, 0.18);
 }
 
+/* "Clear" after the first click: waiting for the confirming second one. */
+.ht4m-btn.armed {
+  color: @ht_background;
+  background-color: @ht_primary;
+}
+
 .ht4m-btn:active {
   color: @ht_background;
   background-color: @ht_primary;
