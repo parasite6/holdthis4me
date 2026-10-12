@@ -26,14 +26,13 @@ const STRIP_WIDTH: i32 = 2;
 const STRIP_SHARE: f64 = 0.45;
 /// Hovering opens it when the pointer is pushed against the screen border near the
 /// corner: the top edge or the left edge, within this distance of the corner, after
-/// resting there this long (so passing by doesn't pop it out). Only the 2 px border
+/// resting there this long (so sliding along the edge doesn't pop it out). Only the 2 px border
 /// itself reacts, never anything inside the screen where apps are. Drags anywhere on
 /// either strip open it at once.
 const BORDER_REACH: i32 = 200;
-const DWELL_MS: u64 = 150;
+const DWELL_MS: u64 = 60;
 /// The drop-in/rise-out animation (style.css has the matching durations).
 const RISE_MS: u64 = 200;
-const FIRST_FRAME_MS: u64 = 30;
 /// After the pointer leaves the shelf it goes away after this long. A drag that leaves
 /// (usually: just dropped something) gets longer, so you see the item land.
 const LEAVE_MS: u64 = 350;
@@ -585,8 +584,16 @@ impl Holder {
         self.anim_css.load_from_string(&format!(".ht4m-frame.away {{ transform: translateY(-{height}px); }}"));
         self.frame.add_css_class("away");
         self.shelf.present();
-        let frame = self.frame.clone();
-        self.anim_timer.start(FIRST_FRAME_MS, move || frame.remove_css_class("away"));
+        // Drop as soon as the first frame (still above the edge) has been drawn.
+        let frames = Cell::new(0);
+        self.frame.add_tick_callback(move |frame, _| {
+            frames.set(frames.get() + 1);
+            if frames.get() < 2 {
+                return glib::ControlFlow::Continue;
+            }
+            frame.remove_css_class("away");
+            glib::ControlFlow::Break
+        });
         self.hide_timer.start(untouched_ms, untouched);
     }
 

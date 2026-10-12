@@ -8,7 +8,7 @@ through Nautilus in every upload dialog.
 
 | Do this | What happens |
 | --- | --- |
-| Push the pointer against the top or left screen border, within 200 px of the corner | The shelf drops down (after a 150 ms pause, so passing by doesn't trigger it) |
+| Push the pointer against the top or left screen border, within 200 px of the corner | The shelf drops down (after a 60 ms pause, so sliding along the edge doesn't trigger it) |
 | Drag files or folders onto the top part of the left screen edge | The shelf opens at once, and you drop them on it |
 | `+` / folder button | Opens the file chooser, so you can pick files or folders by browsing |
 | Drag an item off the shelf into any app | The app gets the real file; the item stays on the shelf |
