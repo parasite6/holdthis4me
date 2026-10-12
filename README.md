@@ -36,7 +36,7 @@ folder in Nautilus and add or delete links there; the shelf follows.
 Safety rules:
 
 - Drags out offer **copy** only. Dropping into Nautilus copies the file; it never moves your original.
-- Drops in accept **copy** only. Accepting "move" would tell Nautilus to delete the originals.
+- Drops in ask for **copy**, but "move" is let in as well. Hyprland ignores what the receiving app asks for and settles every drag as "move" (it's in the log: `drop, settled as MOVE`). A copy-only target therefore takes nothing at all, and that's why drops first failed. holdthis4me only ever adds a link, and file managers don't delete on a "move" into another app; tested with a throwaway file, which stayed put. One caveat: a browser may delete text dragged *out of a text box you're typing in* when the drag is a "move". Drag text from the page itself.
 - Letting go deletes only the link, never the file it points to. It refuses anything in the folder that isn't a symlink (there's a test for this).
 - Every change goes through a handle on the shelf folder itself. The folder is opened without following symlinks, and only if it's a real directory you own that nobody else can write to. If the shelf path were ever swapped for a symlink to another folder, nothing there could be listed, added or removed; "Clear" could never sweep your real links.
 - Removing moves the entry aside under a private name first, then checks what it actually moved. Only a symlink is deleted; anything else is put back. Nothing can be swapped in between the check and the delete. If a removal is ever interrupted, startup finishes it, again for symlinks only.
@@ -107,6 +107,8 @@ Source: `src/main.rs` (UI, triggers, drag and drop, theme), `src/shelf.rs` (the 
 with tests), `src/style.css`.
 
 Build and test: `PKG_CONFIG=/usr/bin/pkg-config cargo test --release`.
+
+Log: `journalctl --user -t holdthis4me`. The start script runs it through `systemd-cat`, which records refused drags and other errors.
 
 ## Audit (2026-10-11)
 

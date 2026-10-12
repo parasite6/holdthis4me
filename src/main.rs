@@ -280,6 +280,8 @@ impl Holder {
 
         let empty = gtk::Label::builder()
             .label("Drop files, folders, text or links here")
+            .wrap(true)
+            .justify(gtk::Justification::Center)
             .vexpand(true)
             .css_classes(["ht4m-empty"])
             .build();
@@ -401,14 +403,32 @@ impl Holder {
         self.drag_all.add_controller(all);
     }
 
-    /// Accepts files and folders, and text or web links (saved as notes). Only ever COPY:
-    /// accepting MOVE would tell the app they came from (e.g. Nautilus) to delete its
-    /// originals. Files come first: a drag offering both (a file manager) gives files.
+    /// Accepts files and folders, and text or web links (saved as notes). Files come
+    /// first: a drag offering both (a file manager) gives files.
+    ///
+    /// Asks for COPY, but lets MOVE in: Hyprland reports and settles every drag as MOVE,
+    /// ignoring what the receiving app asks for, so a COPY-only target takes nothing.
     fn drop_target(self: &Rc<Self>) -> gtk::DropTarget {
-        let target = gtk::DropTarget::new(glib::Type::INVALID, gdk::DragAction::COPY);
+        let target = gtk::DropTarget::new(glib::Type::INVALID, gdk::DragAction::COPY | gdk::DragAction::MOVE);
         target.set_types(&[gdk::FileList::static_type(), String::static_type()]);
+        // Logged to the journal (`journalctl --user -t holdthis4me`), so a drop that
+        // doesn't take can be diagnosed.
+        target.connect_accept(|t, drop| {
+            let ok = t.formats().is_some_and(|f| drop.formats().match_(&f));
+            if !ok {
+                eprintln!("holdthis4me: drag refused: offers {} only", drop.formats().to_str());
+            }
+            ok
+        });
+        target.connect_enter(|_, _, _| gdk::DragAction::COPY);
+        target.connect_motion(|_, _, _| gdk::DragAction::COPY);
         let w = Rc::downgrade(self);
-        target.connect_drop(move |_, value, _, _| {
+        target.connect_drop(move |t, value, _, _| {
+            // Hyprland settles every drag as MOVE whatever we ask for. Taken anyway: we only
+            // ever add a link, and file managers don't delete on a MOVE into another app
+            // (it's what every drag on Hyprland already is). Logged for the record.
+            let settled = t.current_drop().map(|d| d.actions()).unwrap_or(gdk::DragAction::empty());
+            eprintln!("holdthis4me: drop, settled as {settled:?}");
             let Some(h) = w.upgrade() else { return false };
             let took = if let Ok(files) = value.get::<gdk::FileList>() {
                 // Local files are held as they are; a web address in the list (a link
@@ -430,6 +450,9 @@ impl Holder {
             } else {
                 false
             };
+            if !took {
+                eprintln!("holdthis4me: drop of {} not taken", value.type_());
+            }
             h.reload();
             took
         });
