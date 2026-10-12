@@ -26,9 +26,10 @@ window.ht4m {
 }
 
 /* The gradient border layer (the bar's pillBg). The margin is the gap to the screen
- * edges and room for the shadow. */
+ * edges and room for the shadow. The top is 11px so the shelf lines up with the bar's
+ * pill: centered in its 72px band, the 50px expanded pill starts 11px down. */
 .ht4m-frame {
-  margin: 16px;
+  margin: 11px 16px 16px 16px;
   padding: 2px;
   border-radius: 16px;
   background-image: linear-gradient(to bottom, alpha(@ht_primary, 0.8), alpha(@ht_on_primary, 0.8));
