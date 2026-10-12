@@ -121,4 +121,5 @@ Build and test: `PKG_CONFIG=/usr/bin/pkg-config cargo test --release`.
 **Known limits:**
 
 - **Name squatting:** any program running as you could claim the D-Bus name first, or call `--toggle`. That's the same trust level as you, so it isn't guarded.
-- **Hung mounts:** a background check stuck on a hung mount keeps one GIO worker thread busy until the mount answers or times out.
+- **Hung mounts:** a background check stuck on a hung mount keeps one GIO worker thread busy until the mount answers or times out. A file whose check is still running is never checked again, so reopening the shelf doesn't pile up more stuck checks.
+- **Refused folder:** if the shelf folder is refused, the shelf says why in place of "Drop files or folders here".

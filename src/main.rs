@@ -216,6 +216,9 @@ struct Holder {
     /// `generation` tells a late check that a newer reload has replaced its row.
     missing: RefCell<HashSet<PathBuf>>,
     generation: Cell<u64>,
+    /// Targets whose background check hasn't come back yet. Not checked again until it
+    /// does, so a hung mount ties up one worker thread, not one more per opening.
+    checking: RefCell<HashSet<PathBuf>>,
     /// "Clear" was clicked once and is waiting for the confirming second click.
     clear_armed: Rc<Timer>,
     triggers: RefCell<Vec<gtk::ApplicationWindow>>,
@@ -320,6 +323,7 @@ impl Holder {
             held: RefCell::default(),
             missing: RefCell::default(),
             generation: Cell::new(0),
+            checking: RefCell::default(),
             clear_armed: Rc::default(),
             triggers: RefCell::default(),
             monitor: RefCell::default(),
@@ -762,6 +766,11 @@ impl Holder {
             self.list.append(&self.row(item));
         }
         let held: Vec<PathBuf> = items.iter().map(|i| i.target.clone()).collect();
+        // A refused shelf folder lists nothing and takes nothing: say why, on the shelf.
+        self.empty.set_label(&match shelf::usable(&self.dir) {
+            Ok(()) => "Drop files or folders here".to_string(),
+            Err(e) => format!("Shelf folder unusable:\n{e}\n{}", tilde(&self.dir)),
+        });
         self.empty.set_visible(items.is_empty());
         self.scroller.set_visible(!items.is_empty());
         self.drag_all.set_visible(held.len() > 1);
@@ -864,6 +873,9 @@ impl Holder {
         });
         row.add_controller(click);
 
+        if !self.checking.borrow_mut().insert(item.target.clone()) {
+            return row; // an earlier check is still out; its result triggers a fresh reload
+        }
         let generation = self.generation.get();
         let target = item.target.clone();
         let (row_w, icon_w, place_w, reveal_w) = (row.downgrade(), icon.downgrade(), place.downgrade(), reveal.downgrade());
@@ -874,8 +886,19 @@ impl Holder {
             None::<&gio::Cancellable>,
             move |result| {
                 let Some(h) = w.upgrade() else { return };
+                h.checking.borrow_mut().remove(&target);
                 if h.generation.get() != generation {
-                    return; // rebuilt since: this row is gone
+                    // Rebuilt since: this row is gone, and the new one skipped its check
+                    // while this one was out. Rebuild once more so it gets one.
+                    if h.shown() {
+                        let w = Rc::downgrade(&h);
+                        h.reload_timer.start(100, move || {
+                            if let Some(h) = w.upgrade() {
+                                h.reload();
+                            }
+                        });
+                    }
+                    return;
                 }
                 let (Some(row), Some(icon), Some(place), Some(reveal)) =
                     (row_w.upgrade(), icon_w.upgrade(), place_w.upgrade(), reveal_w.upgrade())

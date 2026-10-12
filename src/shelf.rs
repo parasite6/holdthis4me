@@ -64,6 +64,11 @@ pub fn prepare(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Ok if the shelf folder is one this code will add to and remove from (see `open_dir`).
+pub fn usable(dir: &Path) -> io::Result<()> {
+    open_dir(dir).map(drop)
+}
+
 fn cstr(s: &OsStr) -> io::Result<CString> {
     CString::new(s.as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in name"))
 }
