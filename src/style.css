@@ -17,8 +17,12 @@ window.ht4m-trigger {
   background-color: rgba(0, 0, 0, 0.01);
 }
 
+/* The shelf stays mapped while hidden (so it comes out without waiting for a new
+ * window), and a surface with nothing to draw may never be shown by Hyprland: hence 1%
+ * black, which can't be seen. It takes no input while hidden (main.rs). */
 window.ht4m {
   font-family: "JetBrains Mono", monospace;
+  background-color: rgba(0, 0, 0, 0.01);
 }
 
 /* The gradient border layer (the bar's pillBg). The margin is the gap to the screen

@@ -21,17 +21,13 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 const APP_ID: &str = "local.holdthis4me";
 const STYLE: &str = include_str!("style.css");
 
-/// The trigger strip: this wide, and this share of the screen height from the top.
+/// The triggers are 2 px strips on the screen border itself (never further in, where
+/// apps are), exactly as long as the shelf is wide/tall, so touching the border anywhere
+/// the shelf will appear opens it at once.
 const STRIP_WIDTH: i32 = 2;
-const STRIP_SHARE: f64 = 0.45;
-/// Hovering opens it when the pointer is pushed against the screen border near the
-/// corner: the top edge or the left edge, within this distance of the corner, after
-/// resting there this long (so sliding along the edge doesn't pop it out). Only the 2 px border
-/// itself reacts, never anything inside the screen where apps are. Drags anywhere on
-/// either strip open it at once.
-const BORDER_REACH: i32 = 200;
-const DWELL_MS: u64 = 60;
-/// The drop-in/rise-out animation (style.css has the matching durations).
+/// The shelf's frame margin (style.css .ht4m-frame): the gap to the screen edges.
+const FRAME_MARGIN: i32 = 16;
+/// Rising back out (style.css .ht4m-frame.away has the matching duration).
 const RISE_MS: u64 = 200;
 /// After the pointer leaves the shelf it goes away after this long. A drag that leaves
 /// (usually: just dropped something) gets longer, so you see the item land.
@@ -44,12 +40,14 @@ const TOGGLE_MS: u64 = 6000;
 /// The surface's width, including the transparent margin around the frame (room for
 /// its shadow, and the gap to the screen edges, like the bar and dock have).
 const SHELF_WIDTH: i32 = 372;
+/// The surface's height when empty or nearly so; it grows with the items.
+const SHELF_MIN_HEIGHT: i32 = 260;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Trigger {
-    /// 2 px along the top edge from the corner.
+    /// 2 px along the top edge, as long as the shelf is wide.
     Top,
-    /// 2 px down the left edge (taller, so drags along the edge land too).
+    /// 2 px down the left edge, as long as the shelf's smallest height.
     Left,
 }
 const ICON_SIZE: i32 = 32;
@@ -187,10 +185,6 @@ impl Timer {
             id.remove();
         }
     }
-
-    fn running(&self) -> bool {
-        self.0.borrow().is_some()
-    }
 }
 
 struct Holder {
@@ -213,7 +207,9 @@ struct Holder {
     /// The screen the shelf is on (or was last on).
     monitor: RefCell<Option<gdk::Monitor>>,
     hide_timer: Rc<Timer>,
-    dwell: Rc<Timer>,
+    /// Out (or on its way out). When it's not, the shelf stays mapped but transparent,
+    /// slid away and click-through, so coming out never waits for a new window.
+    out: Cell<bool>,
     reload_timer: Rc<Timer>,
     /// One of our items is being dragged out. The shelf must stay mapped until the drag
     /// ends (unmapping the drag source can cancel the drag), and its rows must not be
@@ -309,7 +305,7 @@ impl Holder {
             triggers: RefCell::default(),
             monitor: RefCell::default(),
             hide_timer: Rc::default(),
-            dwell: Rc::default(),
+            out: Cell::new(false),
             reload_timer: Rc::default(),
             dragging_out: Cell::new(false),
             stale: Cell::new(false),
@@ -333,9 +329,23 @@ impl Holder {
         }));
 
         h.wire_shelf();
+        // GTK may reset the input region when it lays the window out again; re-apply
+        // ours after every layout, so the hidden shelf never blocks clicks.
+        let w = Rc::downgrade(&h);
+        h.shelf.connect_realize(move |shelf| {
+            let w = w.clone();
+            if let Some(surface) = shelf.surface() {
+                surface.connect_layout(move |_, _, _| {
+                    if let Some(h) = w.upgrade() {
+                        h.set_clickable(h.out.get());
+                    }
+                });
+            }
+        });
         h.watch_dir();
         h.watch_monitors();
         h.reload();
+        h.toggle_ready();
         h
     }
 
@@ -429,7 +439,7 @@ impl Holder {
                 let w = Rc::downgrade(self);
                 watch.connect_changed(move |_, _, _, _| {
                     let Some(h) = w.upgrade() else { return };
-                    if h.shelf.is_visible() {
+                    if h.shown() {
                         let w = Rc::downgrade(&h);
                         h.reload_timer.start(100, move || {
                             if let Some(h) = w.upgrade() {
@@ -471,6 +481,7 @@ impl Holder {
             && !current.contains(m)
         {
             self.shelf.set_visible(false);
+            self.out.set(false);
         }
         let triggers = current
             .iter()
@@ -490,8 +501,8 @@ impl Holder {
         t.set_exclusive_zone(-1);
         t.set_monitor(Some(monitor));
         let (width, height) = match kind {
-            Trigger::Top => (BORDER_REACH, STRIP_WIDTH),
-            Trigger::Left => (STRIP_WIDTH, strip_height(monitor).max(BORDER_REACH)),
+            Trigger::Top => (SHELF_WIDTH - FRAME_MARGIN, STRIP_WIDTH),
+            Trigger::Left => (STRIP_WIDTH, SHELF_MIN_HEIGHT - FRAME_MARGIN),
         };
         // Needs a child of exactly this size: a GTK window without one is 200×200.
         let fill = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -500,36 +511,14 @@ impl Holder {
         t.set_default_size(width, height);
 
         let w = Rc::downgrade(self);
-        // Resting against the border near the corner opens it.
-        let m = monitor.clone();
-        let near_corner = move |h: &Rc<Holder>, y: f64| {
-            if h.shown() || (kind == Trigger::Left && y > BORDER_REACH as f64) {
-                h.dwell.cancel();
-            } else if !h.dwell.running() {
-                let (w, m) = (Rc::downgrade(h), m.clone());
-                h.dwell.start(DWELL_MS, move || {
-                    if let Some(h) = w.upgrade() {
-                        h.show(&m, UNTOUCHED_MS);
-                    }
-                });
-            }
-        };
-        let near_corner = Rc::new(near_corner);
+        // Touching the border opens it, instantly.
         let hover = gtk::EventControllerMotion::new();
-        for signal in ["enter", "motion"] {
-            let (w, near_corner) = (w.clone(), near_corner.clone());
-            let f = move |_: &gtk::EventControllerMotion, _: f64, y: f64| {
-                if let Some(h) = w.upgrade() {
-                    near_corner(&h, y);
-                }
-            };
-            if signal == "enter" {
-                hover.connect_enter(f);
-            } else {
-                hover.connect_motion(f);
+        let m = monitor.clone();
+        hover.connect_enter(move_with(&w, move |h| {
+            if !h.shown() {
+                h.show(&m, UNTOUCHED_MS);
             }
-        }
-        hover.connect_leave(with(&w, |h| h.dwell.cancel()));
+        }));
         t.add_controller(hover);
 
         // Something from another app is being dragged onto the corner or the edge: open
@@ -550,62 +539,91 @@ impl Holder {
         t
     }
 
-    /// Out, and not on its way back in.
     fn shown(&self) -> bool {
-        self.shelf.is_visible() && !self.frame.has_css_class("away")
+        self.out.get()
+    }
+
+    /// Put the (hidden) shelf on `monitor`. Moving a layer surface to another screen
+    /// needs a fresh map; on the same screen it stays mapped the whole time.
+    fn place(&self, monitor: &gdk::Monitor) {
+        if self.shelf.is_visible() && self.monitor.borrow().as_ref() == Some(monitor) {
+            return;
+        }
+        self.shelf.set_visible(false);
+        *self.monitor.borrow_mut() = Some(monitor.clone());
+        self.shelf.set_monitor(Some(monitor));
+        self.frame.add_css_class("away");
+        self.fit();
+        self.shelf.present();
+        self.set_clickable(false);
+    }
+
+    /// Hidden, the surface takes no input at all: clicks and drags go to whatever is
+    /// underneath.
+    fn set_clickable(&self, clickable: bool) {
+        let Some(surface) = self.shelf.surface() else { return };
+        // None: the whole surface; an empty region: nothing.
+        let nothing = gtk::cairo::Region::create();
+        surface.set_input_region((!clickable).then_some(&nothing));
     }
 
     fn show(self: &Rc<Self>, monitor: &gdk::Monitor, untouched_ms: u64) {
-        self.dwell.cancel();
         let w = Rc::downgrade(self);
         let untouched = move || {
             if let Some(h) = w.upgrade() {
                 h.hide();
             }
         };
-        if self.shelf.is_visible() && self.monitor.borrow().as_ref() == Some(monitor) {
-            // Already out, or still rising away: drop back down from where it is.
-            self.hide_timer.cancel();
-            if self.frame.has_css_class("away") {
-                self.anim_timer.cancel();
-                self.frame.remove_css_class("away");
-                self.hide_timer.start(untouched_ms, untouched);
-            }
+        self.hide_timer.cancel();
+        if self.out.get() && self.monitor.borrow().as_ref() == Some(monitor) {
+            self.hide_timer.start(untouched_ms, untouched);
             return;
         }
         self.anim_timer.cancel();
-        self.shelf.set_visible(false);
-        *self.monitor.borrow_mut() = Some(monitor.clone());
-        self.shelf.set_monitor(Some(monitor));
+        let fresh = !self.shelf.is_visible() || self.monitor.borrow().as_ref() != Some(monitor);
+        self.place(monitor);
         self.shelf.set_layer(Layer::Overlay);
+        self.out.set(true);
         self.reload();
-        // Start above the screen's top edge, then let the CSS transition drop it in.
-        let height = self.shelf.default_size().1;
-        self.anim_css.load_from_string(&format!(".ht4m-frame.away {{ transform: translateY(-{height}px); }}"));
-        self.frame.add_css_class("away");
-        self.shelf.present();
-        // Drop as soon as the first frame (still above the edge) has been drawn.
-        let frames = Cell::new(0);
-        self.frame.add_tick_callback(move |frame, _| {
-            frames.set(frames.get() + 1);
-            if frames.get() < 2 {
-                return glib::ControlFlow::Continue;
-            }
-            frame.remove_css_class("away");
-            glib::ControlFlow::Break
-        });
+        self.set_clickable(true);
+        if fresh {
+            // Just mapped: drop once its first frame (still above the edge) is drawn.
+            let frames = Cell::new(0);
+            self.frame.add_tick_callback(move |frame, _| {
+                frames.set(frames.get() + 1);
+                if frames.get() < 2 {
+                    return glib::ControlFlow::Continue;
+                }
+                frame.remove_css_class("away");
+                glib::ControlFlow::Break
+            });
+        } else {
+            self.frame.remove_css_class("away");
+        }
         self.hide_timer.start(untouched_ms, untouched);
     }
 
-    /// Rise back up, then unmap.
+    /// Rise back up and stop taking input; the surface stays mapped.
     fn hide(&self) {
         self.hide_timer.cancel();
-        if self.dragging_out.get() || !self.shown() {
+        if self.dragging_out.get() || !self.out.get() {
             return;
         }
+        self.out.set(false);
         self.frame.add_css_class("away");
+        self.set_clickable(false);
+        // Back on top once it's out of sight (a drag-out moved it below windows).
         let shelf = self.shelf.clone();
-        self.anim_timer.start(RISE_MS, move || shelf.set_visible(false));
+        self.anim_timer.start(RISE_MS, move || shelf.set_layer(Layer::Overlay));
+    }
+
+    /// Map the hidden shelf right away on the first screen, so the first open is as
+    /// quick as the rest.
+    fn toggle_ready(&self) {
+        let monitors = gdk::Display::default().expect("no display").monitors();
+        if let Some(m) = monitors.item(0).and_downcast::<gdk::Monitor>() {
+            self.place(&m);
+        }
     }
 
     fn toggle(self: &Rc<Self>) {
@@ -691,15 +709,18 @@ impl Holder {
         self.fit();
     }
 
-    /// Tall enough to cover the trigger strip (so a drag along the edge lands on the
-    /// shelf), taller as items pile up, scrolling past 80% of the screen.
+    /// At least as tall as the left trigger strip (so a drag along the edge lands on the
+    /// shelf), taller as items pile up, scrolling past 80% of the screen. The slide
+    /// starts exactly one shelf-height above the edge.
     fn fit(&self) {
         let Some(m) = self.monitor.borrow().clone() else { return };
         let screen = m.geometry().height();
         let max = (screen as f64 * 0.8) as i32;
         self.scroller.set_max_content_height(max);
         let (_, natural, _, _) = self.shelf.child().expect("frame").measure(gtk::Orientation::Vertical, SHELF_WIDTH);
-        self.shelf.set_default_size(SHELF_WIDTH, natural.clamp(strip_height(&m), max));
+        let height = natural.clamp(SHELF_MIN_HEIGHT, max);
+        self.shelf.set_default_size(SHELF_WIDTH, height);
+        self.anim_css.load_from_string(&format!(".ht4m-frame.away {{ transform: translateY(-{height}px); }}"));
     }
 
     fn row(self: &Rc<Self>, item: &shelf::Item) -> gtk::Box {
@@ -795,10 +816,6 @@ fn move_with<T>(w: &Weak<Holder>, f: impl Fn(&Rc<Holder>) + 'static) -> impl Fn(
             f(&h);
         }
     }
-}
-
-fn strip_height(monitor: &gdk::Monitor) -> i32 {
-    (monitor.geometry().height() as f64 * STRIP_SHARE) as i32
 }
 
 fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {

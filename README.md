@@ -8,7 +8,7 @@ through Nautilus in every upload dialog.
 
 | Do this | What happens |
 | --- | --- |
-| Push the pointer against the top or left screen border, within 200 px of the corner | The shelf drops down (after a 60 ms pause, so sliding along the edge doesn't trigger it) |
+| Touch the top or left screen border where the shelf lives | The shelf drops down instantly |
 | Drag files or folders onto the top part of the left screen edge | The shelf opens at once, and you drop them on it |
 | `+` / folder button | Opens the file chooser, so you can pick files or folders by browsing |
 | Drag an item off the shelf into any app | The app gets the real file; the item stays on the shelf |
@@ -70,11 +70,11 @@ Two lines in the Hyprland config hook it up (already added):
 
 Each screen gets three layer surfaces:
 
-- **Top:** an invisible 2 px strip along the top border, 200 px from the corner. Hover or drag opens the shelf.
-- **Left:** an invisible 2 px strip down the left border, 45% of the screen tall. Hover opens the shelf in the top 200 px; a drag opens it anywhere along the strip.
+- **Top:** an invisible 2 px strip along the top border, exactly as long as the shelf is wide. Hover or drag opens the shelf.
+- **Left:** an invisible 2 px strip down the left border, as long as the shelf's smallest height. Hover or drag opens it.
 
 Only the outermost 2 px react. Apps can reach right up to the screen edge, so nothing sits further in, where it could cover their buttons.
-- **Shelf:** mapped only while it's out. It covers the screen edge and is at least as tall as the strip, so a drag that opened it lands on it.
+- **Shelf:** always mapped, so it comes out without waiting for a new window. While hidden, it's slid away, transparent and click-through: its input region is empty and re-applied after every layout. It sizes to its items (260 px minimum), so a drag that opened it lands on it.
 
 The triggers aren't fully transparent; they're 1% black. GTK never commits a frame for a surface
 with nothing to draw, so Hyprland would never map it.
