@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+gio-unix = "0.22.8"
 gtk = { version = "0.11.5", package = "gtk4", features = ["v4_14"] }
 gtk4-layer-shell = "0.8.1"
 libc = "0.2.190"

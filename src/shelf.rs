@@ -348,6 +348,31 @@ pub fn read_note(notes: &Path, target: &Path) -> Option<Note> {
     Some(Note::Text(body))
 }
 
+/// Extended attribute on a note's file: the app the text was dragged from, as
+/// "<serialized GIcon>\t<app name>". Kept out of the file's contents, which are exactly
+/// the text that was dropped.
+const SOURCE_XATTR: &str = "user.holdthis4me.source";
+
+/// Remember where a note came from (see SOURCE_XATTR). Never follows a symlink.
+pub fn set_note_source(target: &Path, source: &str) -> io::Result<()> {
+    let path = cstr(target.as_os_str())?;
+    let name = cstr(OsStr::new(SOURCE_XATTR))?;
+    check(unsafe { libc::lsetxattr(path.as_ptr(), name.as_ptr(), source.as_ptr().cast(), source.len(), 0) })
+}
+
+/// Where a note came from, if that was recorded.
+pub fn note_source(target: &Path) -> Option<String> {
+    let path = cstr(target.as_os_str()).ok()?;
+    let name = cstr(OsStr::new(SOURCE_XATTR)).ok()?;
+    let mut buf = vec![0u8; 4096];
+    let n = unsafe { libc::lgetxattr(path.as_ptr(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+    if n <= 0 {
+        return None;
+    }
+    buf.truncate(n as usize);
+    String::from_utf8(buf).ok()
+}
+
 /// Is this held target one of our notes (by location only, nothing read)?
 pub fn is_note(notes: &Path, target: &Path) -> bool {
     target.parent() == Some(notes)
@@ -640,6 +665,24 @@ mod tests {
 
         delete_note(&notes, &held).unwrap();
         assert!(!held.exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_note_remembers_where_it_came_from() {
+        let root = tmp("source");
+        let notes = root.join("notes");
+        prepare(&notes).unwrap();
+        let t = write_note(&notes, &Note::Text("hello".into())).unwrap();
+        assert_eq!(note_source(&t), None);
+        match set_note_source(&t, "brave-browser\tBrave") {
+            Ok(()) => {
+                assert_eq!(note_source(&t).as_deref(), Some("brave-browser\tBrave"));
+                assert_eq!(read_note(&notes, &t), Some(Note::Text("hello".into())), "contents untouched");
+            }
+            // A filesystem without user xattrs: the note just has no source.
+            Err(e) => eprintln!("xattrs unsupported here: {e}"),
+        }
         fs::remove_dir_all(&root).unwrap();
     }
 }

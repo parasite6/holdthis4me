@@ -11,7 +11,9 @@
 mod shelf;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::time::Duration;
@@ -214,6 +216,11 @@ struct Holder {
     /// Targets whose background check hasn't come back yet. Not checked again until it
     /// does, so a hung mount ties up one worker thread, not one more per opening.
     checking: RefCell<HashSet<PathBuf>>,
+    /// The window class of the app the current drag came from (Hyprland's active window
+    /// when the drag first reached us); used to label dropped text with its app.
+    drag_from: RefCell<Option<String>>,
+    /// Window class -> "<icon>\t<name>" of its app, looked up once per class.
+    apps_by_class: RefCell<HashMap<String, Option<String>>>,
     /// "Clear" was clicked once and is waiting for the confirming second click.
     clear_armed: Rc<Timer>,
     triggers: RefCell<Vec<gtk::ApplicationWindow>>,
@@ -329,6 +336,8 @@ impl Holder {
             generation: Cell::new(0),
             checking: RefCell::default(),
             clear_armed: Rc::default(),
+            drag_from: RefCell::default(),
+            apps_by_class: RefCell::default(),
             triggers: RefCell::default(),
             monitor: RefCell::default(),
             hide_timer: Rc::default(),
@@ -380,7 +389,10 @@ impl Holder {
         self.shelf.add_controller(hover);
 
         let drag_over = gtk::DropControllerMotion::new();
-        drag_over.connect_enter(move_with(&w, |h| h.hide_timer.cancel()));
+        drag_over.connect_enter(move_with(&w, |h| {
+            h.hide_timer.cancel();
+            h.note_drag_source();
+        }));
         drag_over.connect_leave(with(&w, |h| h.left(AFTER_DROP_MS)));
         self.shelf.add_controller(drag_over);
 
@@ -453,6 +465,7 @@ impl Holder {
             if !took {
                 eprintln!("holdthis4me: drop of {} not taken", value.type_());
             }
+            h.drag_from.take();
             h.reload();
             took
         });
@@ -594,6 +607,7 @@ impl Holder {
             if let Some(h) = w.upgrade()
                 && !h.dragging_out.get()
             {
+                h.note_drag_source();
                 h.show(&m, UNTOUCHED_MS);
             }
         });
@@ -682,6 +696,7 @@ impl Holder {
             return;
         }
         self.out.set(false);
+        self.drag_from.take(); // a drag that left without dropping
         self.frame.add_css_class("away");
         self.set_clickable(false);
         if self.clear_armed.is_running() {
@@ -752,12 +767,21 @@ impl Holder {
         }
     }
 
-    /// Save dropped text or links as notes and hold them; true if any were.
+    /// Save dropped text or links as notes and hold them; true if any were. Text is
+    /// labelled with the app it was dragged from, when that's known.
     fn hold_notes(&self, notes: Vec<shelf::Note>) -> bool {
+        let source = self.drag_from.borrow().clone().and_then(|class| self.app_for_class(&class));
         let paths: Vec<PathBuf> = notes
             .iter()
             .filter_map(|n| match shelf::write_note(&self.notes, n) {
-                Ok(p) => Some(p),
+                Ok(p) => {
+                    if let (shelf::Note::Text(_), Some(src)) = (n, &source)
+                        && let Err(e) = shelf::set_note_source(&p, src)
+                    {
+                        eprintln!("holdthis4me: can't label note with its app: {e}");
+                    }
+                    Some(p)
+                }
                 Err(e) => {
                     eprintln!("holdthis4me: can't save dropped text: {e}");
                     None
@@ -765,6 +789,36 @@ impl Holder {
             })
             .collect();
         !paths.is_empty() && self.hold(&paths)
+    }
+
+    /// Note which app a drag comes from, the first time it reaches us (the strip or the
+    /// shelf). The window you drag from keeps focus during a drag, so it's the active one.
+    fn note_drag_source(&self) {
+        if self.drag_from.borrow().is_none() && !self.dragging_out.get() {
+            *self.drag_from.borrow_mut() = active_window_class();
+        }
+    }
+
+    /// "<icon>\t<name>" for the installed app with this window class (by its launcher's
+    /// StartupWMClass, or a launcher id equal to the class). Cached per class.
+    fn app_for_class(&self, class: &str) -> Option<String> {
+        if let Some(found) = self.apps_by_class.borrow().get(class) {
+            return found.clone();
+        }
+        let want = class.to_lowercase();
+        let all = gio::AppInfo::all();
+        let matches = |a: &&gio::AppInfo| {
+            let wm = a.downcast_ref::<gio_unix::DesktopAppInfo>().and_then(|d| d.startup_wm_class());
+            let id = a.id().map(|i| i.trim_end_matches(".desktop").to_lowercase());
+            wm.is_some_and(|w| w.to_lowercase() == want) || id.as_deref() == Some(want.as_str())
+        };
+        let app = all.iter().filter(|a| a.should_show()).find(matches).or_else(|| all.iter().find(matches));
+        let found = app.and_then(|a| {
+            let icon = a.icon()?.to_string()?;
+            Some(format!("{icon}\t{}", a.display_name()))
+        });
+        self.apps_by_class.borrow_mut().insert(class.to_owned(), found.clone());
+        found
     }
 
     fn toggle(self: &Rc<Self>) {
@@ -876,11 +930,18 @@ impl Holder {
         // Our own notes (dropped text and links) show what they say, not their file name.
         // They're small local files, so reading one here can't hang.
         let note = shelf::is_note(&self.notes, &item.target).then(|| shelf::read_note(&self.notes, &item.target)).flatten();
+        // Text shows the icon of the app it was dragged from, when that was recorded.
+        let source = matches!(note, Some(shelf::Note::Text(_)))
+            .then(|| shelf::note_source(&item.target))
+            .flatten()
+            .and_then(|s| s.split_once('\t').map(|(i, n)| (i.to_owned(), n.to_owned())));
         let icon = gtk::Image::from_icon_name(match &note {
             Some(shelf::Note::Link(_)) => "insert-link-symbolic",
-            Some(shelf::Note::Text(_)) => "format-text-plain-symbolic",
-            None => "text-x-generic",
+            _ => "text-x-generic",
         });
+        if let Some(gicon) = source.as_ref().and_then(|(i, _)| gio::Icon::for_string(i).ok()) {
+            icon.set_from_gicon(&gicon);
+        }
         icon.set_pixel_size(ICON_SIZE);
         icon.add_css_class("ht4m-icon");
         let title = match &note {
@@ -896,7 +957,10 @@ impl Holder {
             .build();
         let parent = match &note {
             Some(shelf::Note::Link(_)) => "link".to_owned(),
-            Some(shelf::Note::Text(t)) => format!("text · {} characters", t.chars().count()),
+            Some(shelf::Note::Text(t)) => match &source {
+                Some((_, app)) => format!("text from {app} · {} characters", t.chars().count()),
+                None => format!("text · {} characters", t.chars().count()),
+            },
             None => item.target.parent().map(tilde).unwrap_or_default(),
         };
         let place = gtk::Label::builder()
@@ -1067,6 +1131,38 @@ fn set_icon(image: &gtk::Image, info: &gio::FileInfo) {
     }
 }
 
+/// The class of Hyprland's active window, straight from its IPC socket (no hyprctl
+/// process). None outside Hyprland or if it doesn't answer within 200 ms.
+fn active_window_class() -> Option<String> {
+    let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok().filter(|s| !s.is_empty() && !s.contains('/'))?;
+    let socket = glib::user_runtime_dir().join("hypr").join(sig).join(".socket.sock");
+    let mut stream = UnixStream::connect(socket).ok()?;
+    let limit = Some(Duration::from_millis(200));
+    stream.set_read_timeout(limit).ok()?;
+    stream.set_write_timeout(limit).ok()?;
+    stream.write_all(b"j/activewindow").ok()?;
+    let mut reply = String::new();
+    stream.take(64 * 1024).read_to_string(&mut reply).ok()?;
+    json_str(&reply, "class").filter(|c| !c.is_empty())
+}
+
+/// The string value of `"key"` in a JSON object (first occurrence), unescaped for the
+/// simple escapes window classes could contain.
+fn json_str(json: &str, key: &str) -> Option<String> {
+    let at = json.find(&format!("\"{key}\""))? + key.len() + 2;
+    let rest = json[at..].trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => out.push(chars.next()?),
+            c => out.push(c),
+        }
+    }
+    None
+}
+
 /// The shelf's screen if it's still connected, else the first one there is.
 fn usable_monitor(preferred: Option<gdk::Monitor>) -> Option<gdk::Monitor> {
     preferred.filter(|m| m.is_valid()).or_else(|| {
@@ -1136,6 +1232,14 @@ fn tilde(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_window_class_from_hyprland_json() {
+        let reply = r#"{"address": "0x1", "initialClass": "wrong", "class": "brave-browser", "title": "a \"q\""}"#;
+        assert_eq!(json_str(reply, "class").as_deref(), Some("brave-browser"));
+        assert_eq!(json_str(reply, "title").as_deref(), Some("a \"q\""));
+        assert_eq!(json_str("{}", "class"), None);
+    }
 
     #[test]
     fn theme_reads_colours_and_falls_back() {
